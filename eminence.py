@@ -988,6 +988,8 @@ class StringExtractorGUI:
         self.sort_reverse = True
 
         self.setup_ui()
+        self._update_group_column_visibility()
+        self._update_column_headers()
 
     def setup_ui(self):
         """Set up the user interface"""
@@ -1010,6 +1012,9 @@ class StringExtractorGUI:
         left_frame = ttk.LabelFrame(main_frame, text="Filters & Options", width=350)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
         left_frame.pack_propagate(False)
+
+        # Make left frame resizable
+        left_frame.bind('<Configure>', lambda e: None)
 
         # Minimum length setting
         ttk.Label(left_frame, text="Minimum Length:").pack(anchor=tk.W, padx=5, pady=2)
@@ -1062,14 +1067,14 @@ class StringExtractorGUI:
         self._create_tooltip(proximity_spin, "Maximum distance in bytes between strings to group them together")
 
         # Group by section
-        self.group_by_section_var = tk.BooleanVar(value=True)
+        self.group_by_section_var = tk.BooleanVar(value=False)
         section_cb = ttk.Checkbutton(grouping_frame, text="Group by Section",
                        variable=self.group_by_section_var, command=self.apply_filters)
         section_cb.pack(anchor=tk.W, padx=5, pady=2)
         self._create_tooltip(section_cb, "Keep strings from different ELF sections in separate groups")
 
         # Semantic grouping
-        self.semantic_grouping_var = tk.BooleanVar(value=True)
+        self.semantic_grouping_var = tk.BooleanVar(value=False)
         semantic_cb = ttk.Checkbutton(grouping_frame, text="Semantic Grouping",
                        variable=self.semantic_grouping_var, command=self.apply_filters)
         semantic_cb.pack(anchor=tk.W, padx=5, pady=2)
@@ -1306,28 +1311,17 @@ class StringExtractorGUI:
 
     def update_ui_after_extraction(self):
         """Update UI after string extraction is complete"""
-        def ui_update_worker():
-            try:
-                # Update filter options
-                self.root.after(0, lambda: self.update_progress(95, "Updating filter options..."))
-                self.root.after(0, self.update_filter_options)
+        # Update filter options
+        self.update_progress(95, "Updating filter options...")
+        self.update_filter_options()
 
-                # Display results
-                self.root.after(0, lambda: self.update_progress(98, "Applying filters and displaying results..."))
+        # Display results immediately
+        self.update_progress(98, "Displaying results...")
+        self.apply_filters()
 
-                # Apply filters automatically after loading
-                def apply_and_finish():
-                    self.apply_filters()
-                    self.status_var.set(f"Extracted {len(self.current_strings)} strings")
-                    self.finish_processing()
-
-                self.root.after(0, apply_and_finish)
-
-            except Exception as e:
-                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to update UI: {e}"))
-                self.root.after(0, self.finish_processing)
-
-        threading.Thread(target=ui_update_worker, daemon=True).start()
+        # Update status and finish
+        self.status_var.set(f"Extracted {len(self.current_strings)} strings")
+        self.finish_processing()
 
     def update_filter_options(self):
         """Update filter checkboxes based on extracted strings"""
@@ -1403,11 +1397,20 @@ class StringExtractorGUI:
 
             # Create temporary grouper with filtered strings
             temp_grouper = StringGrouper()
+
+            # Use progress callback for grouping
+            def grouping_progress(value, status):
+                if show_progress:
+                    # Map grouping progress to 65-85% range
+                    mapped_progress = 65 + (value / 100) * 20
+                    self.update_progress(mapped_progress, status)
+
             self.current_groups = temp_grouper.group_strings(
                 filtered_strings,
                 proximity_threshold=self.proximity_threshold_var.get(),
                 group_by_section=self.group_by_section_var.get(),
-                semantic_grouping=self.semantic_grouping_var.get()
+                semantic_grouping=self.semantic_grouping_var.get(),
+                progress_callback=grouping_progress
             )
 
             if show_progress:
