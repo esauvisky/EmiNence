@@ -128,6 +128,9 @@ class StringGroup:
         self.end_offset = None
         self.size = 0
         self.avg_meaningfulness = 0.0
+        self.avg_shannon_entropy = 0.0
+        self.avg_compression_entropy = 0.0
+        self.avg_ngram_entropy = 0.0
         self.dominant_category = None
 
     def add_string(self, string_info):
@@ -153,6 +156,11 @@ class StringGroup:
 
         # Average meaningfulness
         self.avg_meaningfulness = sum(s.meaningfulness_score for s in self.strings) / len(self.strings)
+
+        # Average entropies
+        self.avg_shannon_entropy = sum(s.entropy_shannon for s in self.strings) / len(self.strings)
+        self.avg_compression_entropy = sum(s.entropy_compression for s in self.strings) / len(self.strings)
+        self.avg_ngram_entropy = sum(s.entropy_ngram for s in self.strings) / len(self.strings)
 
         # Dominant category
         categories = [s.category for s in self.strings]
@@ -445,10 +453,11 @@ class StringExtractor:
 
     def group_strings(self, proximity_threshold: int = 512,
                      group_by_section: bool = True,
-                     semantic_grouping: bool = True) -> List[StringGroup]:
+                     semantic_grouping: bool = True,
+                     progress_callback=None) -> List[StringGroup]:
         """Group the extracted strings"""
         return self.grouper.group_strings(
-            self.strings, proximity_threshold, group_by_section, semantic_grouping
+            self.strings, proximity_threshold, group_by_section, semantic_grouping, progress_callback
         )
 
     def _extract_strings_from_data(self, data: bytes, base_offset: int, section: str) -> List[StringInfo]:
@@ -658,7 +667,24 @@ class StringExtractor:
             string_info.entropy_shannon = self._calculate_shannon_entropy(string_info.decoded_string)
             string_info.entropy_compression = self._calculate_compression_entropy(string_info.raw_data)
             string_info.entropy_ngram = self._calculate_ngram_entropy(string_info.decoded_string)
-            string_info.meaningfulness_score = self._calculate_meaningfulness_score(string_info.decoded_string)
+
+            # Calculate base meaningfulness score
+            base_score = self._calculate_meaningfulness_score(string_info.decoded_string)
+
+            # Incorporate entropy into meaningfulness score
+            # Higher entropy generally indicates more meaningful/structured content
+            # Shannon entropy: weight it positively but cap it
+            entropy_bonus = min(string_info.entropy_shannon * 2, 10)
+
+            # Compression entropy: higher values suggest less redundancy
+            compression_bonus = min(string_info.entropy_compression * 1.5, 8)
+
+            # N-gram entropy: higher values suggest more varied character patterns
+            ngram_bonus = min(string_info.entropy_ngram * 1.5, 8)
+
+            # Combine base score with entropy bonuses
+            string_info.meaningfulness_score = base_score + entropy_bonus + compression_bonus + ngram_bonus
+
             string_info.category = self._categorize_string(string_info.decoded_string)
 
     def _calculate_shannon_entropy(self, s: str) -> float:
@@ -720,7 +746,7 @@ class StringExtractor:
 
         # Path-like structure bonus
         if re.search(r'[/\\][a-zA-Z0-9_.-]+', s):
-            score += 15
+            score += 5
 
         # Error message patterns
         error_patterns = ['error', 'warning', 'exception', 'failed', 'cannot', 'invalid', 'missing']
