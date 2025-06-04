@@ -10,8 +10,113 @@ from collections import Counter, defaultdict
 from elftools.elf.elffile import ELFFile
 from elftools.common.exceptions import ELFError
 import unicodedata
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import threading
+import time
+
+class ProgressDialog:
+    """Progress dialog for long-running operations"""
+
+    def __init__(self, parent, title="Processing..."):
+        self.parent = parent
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title(title)
+        self.dialog.geometry("400x120")
+        self.dialog.resizable(False, False)
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Center the dialog
+        self.dialog.geometry("+%d+%d" % (parent.winfo_rootx() + 50, parent.winfo_rooty() + 50))
+
+        # Progress frame
+        frame = ttk.Frame(self.dialog)
+        frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        self.status_label = ttk.Label(frame, text="Initializing...")
+        self.status_label.pack(pady=(0, 10))
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(0, 10))
+
+        self.cancel_var = tk.BooleanVar()
+        ttk.Button(frame, text="Cancel", command=self.cancel).pack()
+
+    def update_progress(self, value, status="Processing..."):
+        """Update progress bar and status"""
+        self.progress_var.set(value)
+        self.status_label.config(text=status)
+        self.dialog.update()
+
+    def cancel(self):
+        """Cancel the operation"""
+        self.cancel_var.set(True)
+
+    def is_cancelled(self):
+        """Check if operation was cancelled"""
+        return self.cancel_var.get()
+
+    def close(self):
+        """Close the dialog"""
+        self.dialog.destroy()
+
+class BlacklistManager:
+    """Manages string blacklist with regex and text matching"""
+
+    def __init__(self):
+        self.entries = []
+        self.compiled_regexes = []
+
+    def add_entry(self, pattern: str, is_regex: bool = False):
+        """Add a blacklist entry"""
+        entry = {"pattern": pattern, "is_regex": is_regex}
+        if entry not in self.entries:
+            self.entries.append(entry)
+            if is_regex:
+                try:
+                    self.compiled_regexes.append(re.compile(pattern))
+                except re.error:
+                    # Invalid regex, treat as text
+                    entry["is_regex"] = False
+            self._rebuild_regexes()
+
+    def remove_entry(self, index: int):
+        """Remove a blacklist entry"""
+        if 0 <= index < len(self.entries):
+            del self.entries[index]
+            self._rebuild_regexes()
+
+    def _rebuild_regexes(self):
+        """Rebuild compiled regex list"""
+        self.compiled_regexes = []
+        for entry in self.entries:
+            if entry["is_regex"]:
+                try:
+                    self.compiled_regexes.append(re.compile(entry["pattern"]))
+                except re.error:
+                    pass
+
+    def is_blacklisted(self, text: str) -> bool:
+        """Check if text matches any blacklist entry"""
+        for entry in self.entries:
+            if entry["is_regex"]:
+                # Check compiled regexes
+                for regex in self.compiled_regexes:
+                    try:
+                        if regex.search(text):
+                            return True
+                    except:
+                        continue
+            else:
+                # Simple text matching (case insensitive)
+                if entry["pattern"].lower() in text.lower():
+                    return True
+        return False
+
+    def get_entries(self) -> List[Dict]:
+        """Get all blacklist entries"""
+        return self.entries.copy()
 
 class StringGroup:
     """Container for a group of related strings"""
