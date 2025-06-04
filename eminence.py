@@ -61,62 +61,6 @@ class ProgressDialog:
         """Close the dialog"""
         self.dialog.destroy()
 
-class BlacklistManager:
-    """Manages string blacklist with regex and text matching"""
-
-    def __init__(self):
-        self.entries = []
-        self.compiled_regexes = []
-
-    def add_entry(self, pattern: str, is_regex: bool = False):
-        """Add a blacklist entry"""
-        entry = {"pattern": pattern, "is_regex": is_regex}
-        if entry not in self.entries:
-            self.entries.append(entry)
-            if is_regex:
-                try:
-                    self.compiled_regexes.append(re.compile(pattern))
-                except re.error:
-                    # Invalid regex, treat as text
-                    entry["is_regex"] = False
-            self._rebuild_regexes()
-
-    def remove_entry(self, index: int):
-        """Remove a blacklist entry"""
-        if 0 <= index < len(self.entries):
-            del self.entries[index]
-            self._rebuild_regexes()
-
-    def _rebuild_regexes(self):
-        """Rebuild compiled regex list"""
-        self.compiled_regexes = []
-        for entry in self.entries:
-            if entry["is_regex"]:
-                try:
-                    self.compiled_regexes.append(re.compile(entry["pattern"]))
-                except re.error:
-                    pass
-
-    def is_blacklisted(self, text: str) -> bool:
-        """Check if text matches any blacklist entry"""
-        for entry in self.entries:
-            if entry["is_regex"]:
-                # Check compiled regexes
-                for regex in self.compiled_regexes:
-                    try:
-                        if regex.search(text):
-                            return True
-                    except:
-                        continue
-            else:
-                # Simple text matching (case insensitive)
-                if entry["pattern"].lower() in text.lower():
-                    return True
-        return False
-
-    def get_entries(self) -> List[Dict]:
-        """Get all blacklist entries"""
-        return self.entries.copy()
 
 class StringGroup:
     """Container for a group of related strings"""
@@ -366,7 +310,6 @@ class StringExtractor:
         self.sections_data = {}
         self.strings = []
         self.grouper = StringGrouper()
-        self.blacklist = BlacklistManager()
 
         # Encoding settings (ASCII enabled by default, UTF disabled)
         self.extract_ascii = True
@@ -428,11 +371,6 @@ class StringExtractor:
                 # Remove duplicates
                 self._remove_duplicates()
 
-                if progress_callback:
-                    progress_callback(85, "Applying blacklist...")
-
-                # Apply blacklist
-                self._apply_blacklist()
 
                 if progress_callback:
                     progress_callback(90, "Analyzing strings...")
@@ -462,15 +400,6 @@ class StringExtractor:
 
         self.strings = unique_strings
 
-    def _apply_blacklist(self):
-        """Apply blacklist filtering"""
-        filtered_strings = []
-
-        for string_info in self.strings:
-            if not self.blacklist.is_blacklisted(string_info.decoded_string):
-                filtered_strings.append(string_info)
-
-        self.strings = filtered_strings
 
     def group_strings(self, proximity_threshold: int = 512,
                      group_by_section: bool = True,
@@ -838,113 +767,6 @@ class StringExtractor:
 
         return 'Other'
 
-class BlacklistDialog:
-    """Dialog for managing blacklist entries"""
-
-    def __init__(self, parent, blacklist_manager):
-        self.parent = parent
-        self.blacklist = blacklist_manager
-        self.result = None
-
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title("Manage Blacklist")
-        self.dialog.geometry("600x400")
-        self.dialog.transient(parent)
-        self.dialog.grab_set()
-
-        self.setup_ui()
-        self.refresh_list()
-
-    def setup_ui(self):
-        """Set up the dialog UI"""
-        # Main frame
-        main_frame = ttk.Frame(self.dialog)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Add entry frame
-        add_frame = ttk.LabelFrame(main_frame, text="Add New Entry")
-        add_frame.pack(fill=tk.X, pady=(0, 10))
-
-        # Pattern entry
-        ttk.Label(add_frame, text="Pattern:").pack(anchor=tk.W, padx=5, pady=(5, 0))
-        self.pattern_var = tk.StringVar()
-        self.pattern_entry = ttk.Entry(add_frame, textvariable=self.pattern_var)
-        self.pattern_entry.pack(fill=tk.X, padx=5, pady=2)
-
-        # Regex checkbox
-        self.is_regex_var = tk.BooleanVar()
-        ttk.Checkbutton(add_frame, text="Regular Expression", variable=self.is_regex_var).pack(anchor=tk.W, padx=5, pady=2)
-
-        # Add button
-        ttk.Button(add_frame, text="Add", command=self.add_entry).pack(anchor=tk.W, padx=5, pady=5)
-
-        # Existing entries frame
-        list_frame = ttk.LabelFrame(main_frame, text="Current Entries")
-        list_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Listbox with scrollbar
-        list_container = ttk.Frame(list_frame)
-        list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        self.listbox = tk.Listbox(list_container)
-        list_scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=list_scrollbar.set)
-
-        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Buttons frame
-        buttons_frame = ttk.Frame(list_frame)
-        buttons_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        ttk.Button(buttons_frame, text="Remove Selected", command=self.remove_entry).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(buttons_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT)
-
-        # Bottom buttons
-        bottom_frame = ttk.Frame(main_frame)
-        bottom_frame.pack(fill=tk.X, pady=(10, 0))
-
-        ttk.Button(bottom_frame, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT)
-
-        # Bind Enter key to add entry
-        self.pattern_entry.bind('<Return>', lambda e: self.add_entry())
-
-    def add_entry(self):
-        """Add a new blacklist entry"""
-        pattern = self.pattern_var.get().strip()
-        if pattern:
-            self.blacklist.add_entry(pattern, self.is_regex_var.get())
-            self.pattern_var.set("")
-            self.is_regex_var.set(False)
-            self.refresh_list()
-
-    def remove_entry(self):
-        """Remove selected blacklist entry"""
-        selection = self.listbox.curselection()
-        if selection:
-            index = selection[0]
-            self.blacklist.remove_entry(index)
-            self.refresh_list()
-
-    def clear_all(self):
-        """Clear all blacklist entries"""
-        if messagebox.askyesno("Confirm", "Clear all blacklist entries?"):
-            self.blacklist.entries.clear()
-            self.blacklist._rebuild_regexes()
-            self.refresh_list()
-
-    def refresh_list(self):
-        """Refresh the listbox with current entries"""
-        self.listbox.delete(0, tk.END)
-        for entry in self.blacklist.get_entries():
-            prefix = "[REGEX] " if entry["is_regex"] else "[TEXT] "
-            self.listbox.insert(tk.END, prefix + entry["pattern"])
-
-    def set_initial_pattern(self, pattern: str):
-        """Set initial pattern for the dialog"""
-        self.pattern_var.set(pattern)
-        self.pattern_entry.focus_set()
-        self.pattern_entry.select_range(0, tk.END)
 
 class StringExtractorGUI:
     """GUI for the string extractor tool"""
@@ -962,6 +784,8 @@ class StringExtractorGUI:
         self.current_groups = []
         self.show_grouped = tk.BooleanVar(value=True)
         self.is_processing = False
+        self.current_sort_column = "meaning"
+        self.sort_reverse = True
 
         self.setup_ui()
 
@@ -977,9 +801,6 @@ class StringExtractorGUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
-        tools_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Tools", menu=tools_menu)
-        tools_menu.add_command(label="Manage Blacklist", command=self.show_blacklist_dialog)
 
         # Main frame
         main_frame = ttk.Frame(self.root)
@@ -995,6 +816,7 @@ class StringExtractorGUI:
         self.min_length_var = tk.IntVar(value=4)
         min_length_spin = ttk.Spinbox(left_frame, from_=1, to=50, textvariable=self.min_length_var, width=10)
         min_length_spin.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(min_length_spin, "Minimum number of characters required for a string to be extracted")
 
         # Encoding options
         encoding_frame = ttk.LabelFrame(left_frame, text="Encoding Options")
@@ -1005,35 +827,62 @@ class StringExtractorGUI:
         self.extract_utf16le_var = tk.BooleanVar(value=False)
         self.extract_utf16be_var = tk.BooleanVar(value=False)
 
-        ttk.Checkbutton(encoding_frame, text="ASCII", variable=self.extract_ascii_var).pack(anchor=tk.W, padx=5, pady=2)
-        ttk.Checkbutton(encoding_frame, text="UTF-8", variable=self.extract_utf8_var).pack(anchor=tk.W, padx=5, pady=2)
-        ttk.Checkbutton(encoding_frame, text="UTF-16 LE", variable=self.extract_utf16le_var).pack(anchor=tk.W, padx=5, pady=2)
-        ttk.Checkbutton(encoding_frame, text="UTF-16 BE", variable=self.extract_utf16be_var).pack(anchor=tk.W, padx=5, pady=2)
+        ascii_cb = ttk.Checkbutton(encoding_frame, text="ASCII", variable=self.extract_ascii_var, command=self.apply_filters)
+        ascii_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(ascii_cb, "Extract ASCII strings (7-bit characters)")
+
+        utf8_cb = ttk.Checkbutton(encoding_frame, text="UTF-8", variable=self.extract_utf8_var, command=self.apply_filters)
+        utf8_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(utf8_cb, "Extract UTF-8 encoded strings (Unicode)")
+
+        utf16le_cb = ttk.Checkbutton(encoding_frame, text="UTF-16 LE", variable=self.extract_utf16le_var, command=self.apply_filters)
+        utf16le_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(utf16le_cb, "Extract UTF-16 Little Endian strings")
+
+        utf16be_cb = ttk.Checkbutton(encoding_frame, text="UTF-16 BE", variable=self.extract_utf16be_var, command=self.apply_filters)
+        utf16be_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(utf16be_cb, "Extract UTF-16 Big Endian strings")
 
         # Grouping options
         grouping_frame = ttk.LabelFrame(left_frame, text="Grouping Options")
         grouping_frame.pack(fill=tk.X, padx=5, pady=10)
 
         # Enable grouping checkbox
-        ttk.Checkbutton(grouping_frame, text="Enable Grouping",
-                       variable=self.show_grouped, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
+        grouping_cb = ttk.Checkbutton(grouping_frame, text="Enable Grouping",
+                       variable=self.show_grouped, command=self._on_grouping_changed)
+        grouping_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(grouping_cb, "Group nearby strings together for better organization")
 
         # Proximity threshold
         ttk.Label(grouping_frame, text="Proximity Threshold (bytes):").pack(anchor=tk.W, padx=5, pady=2)
-        self.proximity_threshold_var = tk.IntVar(value=512)
+        self.proximity_threshold_var = tk.IntVar(value=1024)
         proximity_spin = ttk.Spinbox(grouping_frame, from_=64, to=4096, textvariable=self.proximity_threshold_var, width=10)
         proximity_spin.pack(anchor=tk.W, padx=5, pady=2)
         proximity_spin.bind('<Return>', lambda e: self.apply_filters())
+        self._create_tooltip(proximity_spin, "Maximum distance in bytes between strings to group them together")
 
         # Group by section
         self.group_by_section_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grouping_frame, text="Group by Section",
-                       variable=self.group_by_section_var, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
+        section_cb = ttk.Checkbutton(grouping_frame, text="Group by Section",
+                       variable=self.group_by_section_var, command=self.apply_filters)
+        section_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(section_cb, "Keep strings from different ELF sections in separate groups")
 
         # Semantic grouping
         self.semantic_grouping_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grouping_frame, text="Semantic Grouping",
-                       variable=self.semantic_grouping_var, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
+        semantic_cb = ttk.Checkbutton(grouping_frame, text="Semantic Grouping",
+                       variable=self.semantic_grouping_var, command=self.apply_filters)
+        semantic_cb.pack(anchor=tk.W, padx=5, pady=2)
+        self._create_tooltip(semantic_cb, "Merge groups with similar content types and categories")
+
+        # Group sort options
+        ttk.Label(grouping_frame, text="Sort Groups by:").pack(anchor=tk.W, padx=5, pady=(10, 2))
+        self.group_sort_var = tk.StringVar(value="meaningfulness")
+        group_sort_options = ["Offset", "Length", "String Count", "Shannon Entropy", "Compression Entropy", "N-gram Entropy", "Meaningfulness", "Group ID"]
+        group_sort_combo = ttk.Combobox(grouping_frame, textvariable=self.group_sort_var, values=group_sort_options, state="readonly")
+        group_sort_combo.pack(fill=tk.X, padx=5, pady=2)
+        group_sort_combo.bind('<<ComboboxSelected>>', self.apply_filters)
+        self._create_tooltip(group_sort_combo, "Choose how to sort groups when grouping is enabled")
 
         # Section filter
         ttk.Label(left_frame, text="Sections:").pack(anchor=tk.W, padx=5, pady=(10, 2))
@@ -1047,22 +896,6 @@ class StringExtractorGUI:
         self.category_frame.pack(fill=tk.X, padx=5, pady=2)
         self.category_vars = {}
 
-        # Encoding filter
-        ttk.Label(left_frame, text="Encodings:").pack(anchor=tk.W, padx=5, pady=(10, 2))
-        self.encoding_frame = ttk.Frame(left_frame)
-        self.encoding_frame.pack(fill=tk.X, padx=5, pady=2)
-        self.encoding_vars = {}
-
-        # Sort options
-        ttk.Label(left_frame, text="Sort by:").pack(anchor=tk.W, padx=5, pady=(10, 2))
-        self.sort_var = tk.StringVar(value="offset")
-        sort_options = ["Offset", "Length", "Shannon Entropy", "Compression Entropy", "N-gram Entropy", "Meaningfulness", "Group"]
-        sort_combo = ttk.Combobox(left_frame, textvariable=self.sort_var, values=sort_options, state="readonly")
-        sort_combo.pack(fill=tk.X, padx=5, pady=2)
-        sort_combo.bind('<<ComboboxSelected>>', self.apply_filters)
-
-        # Apply filters button
-        ttk.Button(left_frame, text="Apply Filters", command=self.apply_filters).pack(fill=tk.X, padx=5, pady=10)
 
         # Right panel - results
         right_frame = ttk.Frame(main_frame)
@@ -1076,10 +909,11 @@ class StringExtractorGUI:
         tree_container = ttk.Frame(tree_frame)
         tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.tree = ttk.Treeview(tree_container, columns=("offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning", "group"), show="tree headings")
+        self.tree = ttk.Treeview(tree_container, columns=("group", "offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning"), show="tree headings")
 
         # Configure columns
         self.tree.heading("#0", text="String")
+        self.tree.heading("group", text="Group")
         self.tree.heading("offset", text="Offset")
         self.tree.heading("section", text="Section")
         self.tree.heading("encoding", text="Encoding")
@@ -1088,11 +922,11 @@ class StringExtractorGUI:
         self.tree.heading("shannon", text="Shannon")
         self.tree.heading("compression", text="Compression")
         self.tree.heading("ngram", text="N-gram")
-        self.tree.heading("meaning", text="Meaning")
-        self.tree.heading("group", text="Group")
+        self.tree.heading("meaning", text="Meaning ▼")
 
         self.tree.column("#0", width=300)
-        self.tree.column("offset", width=80)
+        self.tree.column("group", width=60)
+        self.tree.column("offset", width=100)
         self.tree.column("section", width=80)
         self.tree.column("encoding", width=80)
         self.tree.column("category", width=100)
@@ -1101,7 +935,6 @@ class StringExtractorGUI:
         self.tree.column("compression", width=90)
         self.tree.column("ngram", width=70)
         self.tree.column("meaning", width=70)
-        self.tree.column("group", width=60)
 
         # Scrollbars
         v_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
@@ -1116,11 +949,13 @@ class StringExtractorGUI:
         self.tree.bind("<Double-1>", self.show_string_details)
         self.tree.bind("<Button-3>", self.show_context_menu)  # Right-click
 
+        # Bind column header clicks for sorting
+        for col in ("group", "offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning"):
+            self.tree.heading(col, command=lambda c=col: self.sort_by_column(c))
+
         # Create context menu
         self.context_menu = tk.Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Add to Blacklist", command=self.add_to_blacklist)
         self.context_menu.add_command(label="Copy String", command=self.copy_string)
-        self.context_menu.add_command(label="Copy Offset", command=self.copy_offset)
 
         # Status bar with integrated progress bar
         status_frame = ttk.Frame(right_frame)
@@ -1143,24 +978,6 @@ class StringExtractorGUI:
             self.tree.selection_set(item)
             self.context_menu.post(event.x_root, event.y_root)
 
-    def add_to_blacklist(self):
-        """Add selected string to blacklist"""
-        selection = self.tree.selection()
-        if not selection:
-            return
-
-        item = selection[0]
-        tags = self.tree.item(item, "tags")
-        if not tags or tags[0] == "group_header":
-            return
-
-        string_info = tags[0]
-        if isinstance(string_info, str):
-            return
-
-        # Create blacklist dialog with prefilled pattern
-        dialog = BlacklistDialog(self.root, self.extractor.blacklist)
-        dialog.set_initial_pattern(string_info.decoded_string)
 
     def copy_string(self):
         """Copy selected string to clipboard"""
@@ -1179,31 +996,53 @@ class StringExtractorGUI:
 
         self.root.clipboard_clear()
         self.root.clipboard_append(string_info.decoded_string)
+        self.root.update()  # Ensure clipboard is updated
 
-    def copy_offset(self):
-        """Copy selected string offset to clipboard"""
-        selection = self.tree.selection()
-        if not selection:
-            return
+    def sort_by_column(self, column):
+        """Sort tree by column header click"""
+        if self.current_sort_column == column:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.current_sort_column = column
+            self.sort_reverse = False
 
-        item = selection[0]
-        tags = self.tree.item(item, "tags")
-        if not tags or tags[0] == "group_header":
-            return
+        self._update_column_headers()
+        self.apply_filters()
 
-        string_info = tags[0]
-        if isinstance(string_info, str):
-            return
+    def _on_grouping_changed(self):
+        """Handle grouping mode change"""
+        self._update_group_column_visibility()
+        self.apply_filters()
 
-        self.root.clipboard_clear()
-        self.root.clipboard_append(f"0x{string_info.offset:x}")
+    def _update_column_headers(self):
+        """Update column headers to show sort indicators"""
+        # Clear all headers first
+        self.tree.heading("#0", text="String")
+        self.tree.heading("group", text="Group")
+        self.tree.heading("offset", text="Offset")
+        self.tree.heading("section", text="Section")
+        self.tree.heading("encoding", text="Encoding")
+        self.tree.heading("category", text="Category")
+        self.tree.heading("length", text="Length")
+        self.tree.heading("shannon", text="Shannon")
+        self.tree.heading("compression", text="Compression")
+        self.tree.heading("ngram", text="N-gram")
+        self.tree.heading("meaning", text="Meaning")
 
-    def show_blacklist_dialog(self):
-        """Show blacklist management dialog"""
-        BlacklistDialog(self.root, self.extractor.blacklist)
-        # Refresh the view to apply any blacklist changes
-        if self.current_strings:
-            self.apply_filters()
+        # Add sort indicator to current column
+        if self.current_sort_column:
+            arrow = " ▼" if self.sort_reverse else " ▲"
+            current_text = self.tree.heading(self.current_sort_column, "text")
+            if current_text:
+                self.tree.heading(self.current_sort_column, text=current_text + arrow)
+
+    def _update_group_column_visibility(self):
+        """Show/hide group column based on grouping mode"""
+        if self.show_grouped.get():
+            self.tree["displaycolumns"] = ("group", "offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning")
+        else:
+            self.tree["displaycolumns"] = ("offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning")
+
 
     def show_progress(self, show=True):
         """Show or hide the progress bar"""
@@ -1275,11 +1114,14 @@ class StringExtractorGUI:
 
                 # Display results
                 self.root.after(0, lambda: self.update_progress(98, "Applying filters and displaying results..."))
-                self.root.after(0, self.apply_filters)
 
-                # Finish
-                self.root.after(0, lambda: self.status_var.set(f"Extracted {len(self.current_strings)} strings"))
-                self.root.after(0, self.finish_processing)
+                # Apply filters automatically after loading
+                def apply_and_finish():
+                    self.apply_filters()
+                    self.status_var.set(f"Extracted {len(self.current_strings)} strings")
+                    self.finish_processing()
+
+                self.root.after(0, apply_and_finish)
 
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to update UI: {e}"))
@@ -1294,17 +1136,13 @@ class StringExtractorGUI:
             widget.destroy()
         for widget in self.category_frame.winfo_children():
             widget.destroy()
-        for widget in self.encoding_frame.winfo_children():
-            widget.destroy()
 
         self.section_vars.clear()
         self.category_vars.clear()
-        self.encoding_vars.clear()
 
         # Get unique values
         sections = set(s.section for s in self.current_strings)
         categories = set(s.category for s in self.current_strings)
-        encodings = set(s.encoding for s in self.current_strings)
 
         # Create section checkboxes
         for section in sorted(sections):
@@ -1312,6 +1150,7 @@ class StringExtractorGUI:
             self.section_vars[section] = var
             cb = ttk.Checkbutton(self.section_frame, text=section, variable=var, command=self.apply_filters)
             cb.pack(anchor=tk.W)
+            self._create_tooltip(cb, f"Show/hide strings from ELF section '{section}'")
 
         # Create category checkboxes
         for category in sorted(categories):
@@ -1319,13 +1158,7 @@ class StringExtractorGUI:
             self.category_vars[category] = var
             cb = ttk.Checkbutton(self.category_frame, text=category, variable=var, command=self.apply_filters)
             cb.pack(anchor=tk.W)
-
-        # Create encoding checkboxes
-        for encoding in sorted(encodings):
-            var = tk.BooleanVar(value=True)
-            self.encoding_vars[encoding] = var
-            cb = ttk.Checkbutton(self.encoding_frame, text=encoding, variable=var, command=self.apply_filters)
-            cb.pack(anchor=tk.W)
+            self._create_tooltip(cb, f"Show/hide strings categorized as '{category}'")
 
     def apply_filters(self, event=None):
         """Apply current filters and update the tree view"""
@@ -1344,28 +1177,14 @@ class StringExtractorGUI:
 
         if show_progress:
             self.show_progress(True)
-            self.update_progress(0, "Applying blacklist filters...")
-
-        # Apply blacklist filtering to current strings
-        blacklist_filtered = []
-        total_strings = len(self.current_strings)
-        for i, string_info in enumerate(self.current_strings):
-            if show_progress and i % 500 == 0:
-                progress = (i / total_strings) * 30  # 0-30% for blacklist filtering
-                self.update_progress(progress, f"Applying blacklist filters... ({i}/{total_strings})")
-
-            if not self.extractor.blacklist.is_blacklisted(string_info.decoded_string):
-                blacklist_filtered.append(string_info)
-
-        if show_progress:
-            self.update_progress(35, "Applying UI filters...")
+            self.update_progress(0, "Applying UI filters...")
 
         # Filter strings by UI filters
         filtered_strings = []
-        for i, string_info in enumerate(blacklist_filtered):
+        for i, string_info in enumerate(self.current_strings):
             if show_progress and i % 500 == 0:
-                progress = 35 + (i / len(blacklist_filtered)) * 25  # 35-60% for UI filtering
-                self.update_progress(progress, f"Applying UI filters... ({i}/{len(blacklist_filtered)})")
+                progress = (i / len(self.current_strings)) * 60  # 0-60% for UI filtering
+                self.update_progress(progress, f"Applying UI filters... ({i}/{len(self.current_strings)})")
 
             # Check section filter
             if string_info.section in self.section_vars and not self.section_vars[string_info.section].get():
@@ -1373,10 +1192,6 @@ class StringExtractorGUI:
 
             # Check category filter
             if string_info.category in self.category_vars and not self.category_vars[string_info.category].get():
-                continue
-
-            # Check encoding filter
-            if string_info.encoding in self.encoding_vars and not self.encoding_vars[string_info.encoding].get():
                 continue
 
             filtered_strings.append(string_info)
@@ -1412,30 +1227,58 @@ class StringExtractorGUI:
 
     def _populate_grouped_tree(self, groups):
         """Populate tree with grouped strings"""
-        # Sort groups based on selected sort criteria
-        sort_key = self.sort_var.get().lower()
-        if sort_key == "offset":
+        # Show progress for group sorting if there are many groups
+        show_sort_progress = len(groups) > 100
+
+        if show_sort_progress:
+            self.show_progress(True)
+            self.update_progress(0, "Sorting groups...")
+
+        # Sort groups based on selected group sort criteria
+        group_sort_key = self.group_sort_var.get().lower()
+        if group_sort_key == "offset":
             groups.sort(key=lambda g: g.start_offset or 0)
-        elif sort_key == "length":
+        elif group_sort_key == "length":
             groups.sort(key=lambda g: sum(s.length for s in g.strings), reverse=True)
-        elif sort_key == "shannon entropy":
+        elif group_sort_key == "string count":
+            groups.sort(key=lambda g: len(g.strings), reverse=True)
+        elif group_sort_key == "shannon entropy":
             groups.sort(key=lambda g: g.avg_shannon_entropy, reverse=True)
-        elif sort_key == "compression entropy":
+        elif group_sort_key == "compression entropy":
             groups.sort(key=lambda g: g.avg_compression_entropy, reverse=True)
-        elif sort_key == "n-gram entropy":
+        elif group_sort_key == "n-gram entropy":
             groups.sort(key=lambda g: g.avg_ngram_entropy, reverse=True)
-        elif sort_key == "meaningfulness":
+        elif group_sort_key == "meaningfulness":
             groups.sort(key=lambda g: g.avg_meaningfulness, reverse=True)
-        elif sort_key == "group":
+        elif group_sort_key == "group id":
             groups.sort(key=lambda g: g.group_id)
         else:
             groups.sort(key=lambda g: g.start_offset or 0)
 
-        for group in groups:
+        if show_sort_progress:
+            self.update_progress(20, "Populating tree...")
+
+        # Calculate padding for group names
+        max_group_id = max(g.group_id for g in groups) if groups else 0
+        max_string_count = max(len(g.strings) for g in groups) if groups else 0
+        group_id_width = len(str(max_group_id))
+        string_count_width = len(str(max_string_count))
+
+        for i, group in enumerate(groups):
+            if show_sort_progress and i % 50 == 0:
+                progress = 20 + (i / len(groups)) * 60  # 20-80% for tree population
+                self.update_progress(progress, f"Populating tree... ({i}/{len(groups)} groups)")
+
+            # Create formatted group name
+            group_id_padded = str(group.group_id).rjust(group_id_width)
+            string_count_padded = str(len(group.strings)).rjust(string_count_width)
+            group_name = f"📁 Group {group_id_padded}: {string_count_padded} strings"
+
             # Create group header
             group_item = self.tree.insert("", tk.END,
-                text=f"📁 {group.get_summary()}",
+                text=f"{string_count_padded} strings",
                 values=(
+                    str(group.group_id),
                     f"0x{group.start_offset:x}-0x{group.end_offset:x}" if group.start_offset else "",
                     group.section,
                     "mixed" if len(set(s.encoding for s in group.strings)) > 1 else group.strings[0].encoding,
@@ -1444,29 +1287,37 @@ class StringExtractorGUI:
                     f"{group.avg_shannon_entropy:.2f}",
                     f"{group.avg_compression_entropy:.2f}",
                     f"{group.avg_ngram_entropy:.2f}",
-                    f"{group.avg_meaningfulness:.1f}",
-                    str(group.group_id)
+                    f"{group.avg_meaningfulness:.1f}"
                 ),
                 tags=("group_header",)
             )
 
-            # Sort strings within group
-            sort_key = self.sort_var.get().lower()
-            if sort_key == "offset":
-                group.strings.sort(key=lambda x: x.offset)
-            elif sort_key == "length":
-                group.strings.sort(key=lambda x: x.length, reverse=True)
-            elif sort_key == "shannon entropy":
-                group.strings.sort(key=lambda x: x.entropy_shannon, reverse=True)
-            elif sort_key == "compression entropy":
-                group.strings.sort(key=lambda x: x.entropy_compression, reverse=True)
-            elif sort_key == "n-gram entropy":
-                group.strings.sort(key=lambda x: x.entropy_ngram, reverse=True)
-            elif sort_key == "meaningfulness":
-                group.strings.sort(key=lambda x: x.meaningfulness_score, reverse=True)
+            # Sort strings within group based on column header clicks
+            strings_to_sort = group.strings.copy()
+            if self.current_sort_column:
+                if self.current_sort_column == "offset":
+                    strings_to_sort.sort(key=lambda x: x.offset, reverse=self.sort_reverse)
+                elif self.current_sort_column == "section":
+                    strings_to_sort.sort(key=lambda x: x.section, reverse=self.sort_reverse)
+                elif self.current_sort_column == "encoding":
+                    strings_to_sort.sort(key=lambda x: x.encoding, reverse=self.sort_reverse)
+                elif self.current_sort_column == "category":
+                    strings_to_sort.sort(key=lambda x: x.category, reverse=self.sort_reverse)
+                elif self.current_sort_column == "length":
+                    strings_to_sort.sort(key=lambda x: x.length, reverse=self.sort_reverse)
+                elif self.current_sort_column == "shannon":
+                    strings_to_sort.sort(key=lambda x: x.entropy_shannon, reverse=self.sort_reverse)
+                elif self.current_sort_column == "compression":
+                    strings_to_sort.sort(key=lambda x: x.entropy_compression, reverse=self.sort_reverse)
+                elif self.current_sort_column == "ngram":
+                    strings_to_sort.sort(key=lambda x: x.entropy_ngram, reverse=self.sort_reverse)
+                elif self.current_sort_column == "meaning":
+                    strings_to_sort.sort(key=lambda x: x.meaningfulness_score, reverse=self.sort_reverse)
+                elif self.current_sort_column == "group":
+                    strings_to_sort.sort(key=lambda x: x.group_id if x.group_id is not None else -1, reverse=self.sort_reverse)
 
             # Add strings to group
-            for string_info in group.strings:
+            for string_info in strings_to_sort:
                 display_string = repr(string_info.decoded_string)[1:-1]
                 if len(display_string) > 60:
                     display_string = display_string[:57] + "..."
@@ -1474,6 +1325,7 @@ class StringExtractorGUI:
                 self.tree.insert(group_item, tk.END,
                     text=f"  {display_string}",
                     values=(
+                        str(string_info.group_id) if string_info.group_id is not None else "",
                         f"0x{string_info.offset:x}",
                         string_info.section,
                         string_info.encoding,
@@ -1482,8 +1334,7 @@ class StringExtractorGUI:
                         f"{string_info.entropy_shannon:.2f}",
                         f"{string_info.entropy_compression:.2f}",
                         f"{string_info.entropy_ngram:.2f}",
-                        f"{string_info.meaningfulness_score:.1f}",
-                        str(string_info.group_id) if string_info.group_id is not None else ""
+                        f"{string_info.meaningfulness_score:.1f}"
                     ),
                     tags=(string_info,)
                 )
@@ -1491,33 +1342,44 @@ class StringExtractorGUI:
         # Configure group header styling
         self.tree.tag_configure("group_header", background="#e8f4fd", font=("TkDefaultFont", 9, "bold"))
 
+        if show_sort_progress:
+            self.update_progress(100, "Complete!")
+            # Hide progress bar after a short delay
+            self.root.after(500, lambda: self.show_progress(False))
+
         # Update status
         total_strings = sum(len(g.strings) for g in groups)
-        blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
         if not self.is_processing:
-            self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings ({blacklisted_count} blacklisted)")
+            self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings")
 
     def _populate_flat_tree(self, filtered_strings):
         """Populate tree with flat string list"""
-        # Sort strings
-        sort_key = self.sort_var.get().lower()
-        if sort_key == "offset":
-            filtered_strings.sort(key=lambda x: x.offset)
-        elif sort_key == "length":
-            filtered_strings.sort(key=lambda x: x.length, reverse=True)
-        elif sort_key == "shannon entropy":
-            filtered_strings.sort(key=lambda x: x.entropy_shannon, reverse=True)
-        elif sort_key == "compression entropy":
-            filtered_strings.sort(key=lambda x: x.entropy_compression, reverse=True)
-        elif sort_key == "n-gram entropy":
-            filtered_strings.sort(key=lambda x: x.entropy_ngram, reverse=True)
-        elif sort_key == "meaningfulness":
-            filtered_strings.sort(key=lambda x: x.meaningfulness_score, reverse=True)
-        elif sort_key == "group":
-            filtered_strings.sort(key=lambda x: x.group_id if x.group_id is not None else -1)
+        # Sort strings based on column header clicks
+        strings_to_sort = filtered_strings.copy()
+        if self.current_sort_column:
+            if self.current_sort_column == "offset":
+                strings_to_sort.sort(key=lambda x: x.offset, reverse=self.sort_reverse)
+            elif self.current_sort_column == "section":
+                strings_to_sort.sort(key=lambda x: x.section, reverse=self.sort_reverse)
+            elif self.current_sort_column == "encoding":
+                strings_to_sort.sort(key=lambda x: x.encoding, reverse=self.sort_reverse)
+            elif self.current_sort_column == "category":
+                strings_to_sort.sort(key=lambda x: x.category, reverse=self.sort_reverse)
+            elif self.current_sort_column == "length":
+                strings_to_sort.sort(key=lambda x: x.length, reverse=self.sort_reverse)
+            elif self.current_sort_column == "shannon":
+                strings_to_sort.sort(key=lambda x: x.entropy_shannon, reverse=self.sort_reverse)
+            elif self.current_sort_column == "compression":
+                strings_to_sort.sort(key=lambda x: x.entropy_compression, reverse=self.sort_reverse)
+            elif self.current_sort_column == "ngram":
+                strings_to_sort.sort(key=lambda x: x.entropy_ngram, reverse=self.sort_reverse)
+            elif self.current_sort_column == "meaning":
+                strings_to_sort.sort(key=lambda x: x.meaningfulness_score, reverse=self.sort_reverse)
+            elif self.current_sort_column == "group":
+                strings_to_sort.sort(key=lambda x: x.group_id if x.group_id is not None else -1, reverse=self.sort_reverse)
 
         # Populate tree
-        for string_info in filtered_strings:
+        for string_info in strings_to_sort:
             # Escape string for display
             display_string = repr(string_info.decoded_string)[1:-1]  # Remove quotes
             if len(display_string) > 80:
@@ -1526,6 +1388,7 @@ class StringExtractorGUI:
             self.tree.insert("", tk.END,
                 text=display_string,
                 values=(
+                    str(string_info.group_id) if string_info.group_id is not None else "",
                     f"0x{string_info.offset:x}",
                     string_info.section,
                     string_info.encoding,
@@ -1534,16 +1397,14 @@ class StringExtractorGUI:
                     f"{string_info.entropy_shannon:.2f}",
                     f"{string_info.entropy_compression:.2f}",
                     f"{string_info.entropy_ngram:.2f}",
-                    f"{string_info.meaningfulness_score:.1f}",
-                    str(string_info.group_id) if string_info.group_id is not None else ""
+                    f"{string_info.meaningfulness_score:.1f}"
                 ),
                 tags=(string_info,)
             )
 
         # Update status
-        blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
         if not self.is_processing:
-            self.status_var.set(f"Showing {len(filtered_strings)} strings ({blacklisted_count} blacklisted)")
+            self.status_var.set(f"Showing {len(filtered_strings)} strings")
 
     def show_string_details(self, event):
         """Show detailed information about selected string"""
