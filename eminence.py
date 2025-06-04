@@ -336,36 +336,17 @@ class StringExtractor:
 
                 # Get all sections first for progress calculation
                 sections = list(elf.iter_sections())
-                total_sections = len([s for s in sections if s.data_size > 0])
-                processed_sections = 0
+                valid_sections = [(s.data(), s.name, s['sh_offset']) for s in sections if s.data_size > 0]
+                total_sections = len(valid_sections)
 
                 if progress_callback:
                     progress_callback(0, "Reading ELF sections...")
 
-                # Extract section data
-                for section in sections:
-                    if section.data_size > 0:
-                        section_data = section.data()
-                        section_name = section.name
-                        base_offset = section['sh_offset']
-
-                        if progress_callback:
-                            status = f"Processing section: {section_name}"
-                            progress = (processed_sections / total_sections) * 80  # 80% for extraction
-                            progress_callback(progress, status)
-
-                            # Check for cancellation
-                            if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
-                                if progress_callback.__self__.is_cancelled():
-                                    return []
-
-                        # Extract strings from this section
-                        section_strings = self._extract_strings_from_data(
-                            section_data, base_offset, section_name
-                        )
-                        self.strings.extend(section_strings)
-
-                        processed_sections += 1
+                # Use multiprocessing for section processing if we have multiple sections
+                if total_sections > 1 and multiprocessing.cpu_count() > 1:
+                    self._extract_parallel(valid_sections, progress_callback)
+                else:
+                    self._extract_sequential(valid_sections, progress_callback)
 
                 if progress_callback:
                     progress_callback(80, "Removing duplicates...")
@@ -373,12 +354,11 @@ class StringExtractor:
                 # Remove duplicates
                 self._remove_duplicates()
 
-
                 if progress_callback:
                     progress_callback(90, "Analyzing strings...")
 
-                # Analyze all extracted strings
-                self._analyze_strings(progress_callback)
+                # Analyze all extracted strings with multiprocessing
+                self._analyze_strings_parallel(progress_callback)
 
         except (ELFError, Exception) as e:
             raise Exception(f"Error parsing ELF file: {e}")
@@ -602,8 +582,131 @@ class StringExtractor:
 
         return True
 
-    def _analyze_strings(self, progress_callback=None):
-        """Analyze all extracted strings with progress reporting"""
+    def _extract_sequential(self, sections_data, progress_callback):
+        """Extract strings sequentially from sections"""
+        for i, (section_data, section_name, base_offset) in enumerate(sections_data):
+            if progress_callback:
+                status = f"Processing section: {section_name}"
+                progress = (i / len(sections_data)) * 70  # 0-70% for extraction
+                progress_callback(progress, status)
+
+                # Check for cancellation
+                if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
+                    if progress_callback.__self__.is_cancelled():
+                        return
+
+            # Extract strings from this section
+            section_strings = self._extract_strings_from_data(
+                section_data, base_offset, section_name
+            )
+            self.strings.extend(section_strings)
+
+    def _extract_parallel(self, sections_data, progress_callback):
+        """Extract strings in parallel from sections"""
+        if progress_callback:
+            progress_callback(0, "Starting parallel extraction...")
+
+        # Prepare arguments for worker processes
+        worker_args = []
+        for section_data, section_name, base_offset in sections_data:
+            worker_args.append((
+                section_data, base_offset, section_name,
+                self.min_length, self.extract_ascii, self.extract_utf8,
+                self.extract_utf16le, self.extract_utf16be
+            ))
+
+        # Use ProcessPoolExecutor for parallel processing
+        max_workers = min(multiprocessing.cpu_count(), len(sections_data))
+        completed_sections = 0
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_section = {
+                executor.submit(_extract_strings_worker, args): args[2]
+                for args in worker_args
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_section):
+                section_name = future_to_section[future]
+                try:
+                    section_strings = future.result()
+                    self.strings.extend(section_strings)
+                    completed_sections += 1
+
+                    if progress_callback:
+                        progress = (completed_sections / len(sections_data)) * 70
+                        progress_callback(progress, f"Completed section: {section_name}")
+
+                        # Check for cancellation
+                        if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
+                            if progress_callback.__self__.is_cancelled():
+                                return
+
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(0, f"Error processing {section_name}: {e}")
+
+    def _analyze_strings_parallel(self, progress_callback=None):
+        """Analyze all extracted strings with multiprocessing"""
+        total_strings = len(self.strings)
+
+        if total_strings == 0:
+            return
+
+        # For small numbers of strings, use sequential processing
+        if total_strings < 100:
+            self._analyze_strings_sequential(progress_callback)
+            return
+
+        if progress_callback:
+            progress_callback(90, "Starting parallel analysis...")
+
+        # Split strings into chunks for parallel processing
+        num_workers = min(multiprocessing.cpu_count(), max(1, total_strings // 50))
+        chunk_size = max(1, total_strings // num_workers)
+
+        string_chunks = []
+        for i in range(0, total_strings, chunk_size):
+            chunk = self.strings[i:i + chunk_size]
+            string_chunks.append(chunk)
+
+        completed_chunks = 0
+        analyzed_strings = []
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all analysis tasks
+            future_to_chunk = {
+                executor.submit(_analyze_strings_worker, chunk): i
+                for i, chunk in enumerate(string_chunks)
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_chunk):
+                chunk_idx = future_to_chunk[future]
+                try:
+                    chunk_results = future.result()
+                    analyzed_strings.extend(chunk_results)
+                    completed_chunks += 1
+
+                    if progress_callback:
+                        progress = 90 + (completed_chunks / len(string_chunks)) * 10
+                        progress_callback(progress, f"Analyzed chunk {completed_chunks}/{len(string_chunks)}")
+
+                        # Check for cancellation
+                        if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
+                            if progress_callback.__self__.is_cancelled():
+                                return
+
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(90, f"Error analyzing chunk {chunk_idx}: {e}")
+
+        # Replace strings with analyzed versions
+        self.strings = analyzed_strings
+
+    def _analyze_strings_sequential(self, progress_callback=None):
+        """Analyze all extracted strings sequentially (fallback method)"""
         total_strings = len(self.strings)
 
         for i, string_info in enumerate(self.strings):
