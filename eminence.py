@@ -1511,6 +1511,27 @@ Other strings in this group:
 
             group_text.config(state=tk.DISABLED)
 
+    def _create_tooltip(self, widget, text):
+        """Create a tooltip for a widget"""
+        def on_enter(event):
+            tooltip = tk.Toplevel()
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+
+            label = tk.Label(tooltip, text=text, background="lightyellow",
+                           relief="solid", borderwidth=1, font=("Arial", 9))
+            label.pack()
+
+            widget.tooltip = tooltip
+
+        def on_leave(event):
+            if hasattr(widget, 'tooltip'):
+                widget.tooltip.destroy()
+                del widget.tooltip
+
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+
     def run(self):
         """Start the GUI"""
         self.root.mainloop()
