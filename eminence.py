@@ -92,26 +92,43 @@ class StringGroup:
 
         self.size = self.end_offset - self.start_offset if self.start_offset and self.end_offset else 0
 
-        # Update statistics
-        self._update_statistics()
+        # Note: Statistics will be updated in batch later for performance
 
     def _update_statistics(self):
-        """Update group statistics"""
+        """Update group statistics - optimized version"""
         if not self.strings:
             return
 
-        # Average meaningfulness
-        self.avg_meaningfulness = sum(s.meaningfulness_score for s in self.strings) / len(self.strings)
+        num_strings = len(self.strings)
 
-        # Average entropies
-        self.avg_shannon_entropy = sum(s.entropy_shannon for s in self.strings) / len(self.strings)
-        self.avg_compression_entropy = sum(s.entropy_compression for s in self.strings) / len(self.strings)
-        self.avg_ngram_entropy = sum(s.entropy_ngram for s in self.strings) / len(self.strings)
+        # Calculate averages in single pass
+        total_meaningfulness = 0.0
+        total_shannon = 0.0
+        total_compression = 0.0
+        total_ngram = 0.0
+        category_counts = {}
 
-        # Dominant category
-        categories = [s.category for s in self.strings]
-        category_counts = Counter(categories)
-        self.dominant_category = category_counts.most_common(1)[0][0] if category_counts else "Mixed"
+        for s in self.strings:
+            total_meaningfulness += s.meaningfulness_score
+            total_shannon += s.entropy_shannon
+            total_compression += s.entropy_compression
+            total_ngram += s.entropy_ngram
+
+            # Count categories efficiently
+            category = s.category
+            category_counts[category] = category_counts.get(category, 0) + 1
+
+        # Set averages
+        self.avg_meaningfulness = total_meaningfulness / num_strings
+        self.avg_shannon_entropy = total_shannon / num_strings
+        self.avg_compression_entropy = total_compression / num_strings
+        self.avg_ngram_entropy = total_ngram / num_strings
+
+        # Find dominant category
+        if category_counts:
+            self.dominant_category = max(category_counts.items(), key=lambda x: x[1])[0]
+        else:
+            self.dominant_category = "Mixed"
 
     def get_summary(self) -> str:
         """Get a summary description of this group"""
@@ -181,18 +198,12 @@ class StringGrouper:
                     sections[string_info.section] = []
                 sections[string_info.section].append(string_info)
 
-            group_id = 0
-            total_sections = len(sections)
-            for i, (section_name, section_strings) in enumerate(sections.items()):
-                if progress_callback:
-                    progress = 20 + (i / total_sections) * 40  # 20-60%
-                    progress_callback(progress, f"Grouping section: {section_name}")
-
-                section_groups = self._group_by_proximity(
-                    section_strings, proximity_threshold, group_id, section_name
-                )
-                self.groups.extend(section_groups)
-                group_id += len(section_groups)
+            # Use multiprocessing for large datasets with many sections
+            total_strings = sum(len(strings) for strings in sections.values())
+            if len(sections) > 2 and total_strings > 2000:
+                self._group_sections_parallel(sections, proximity_threshold, progress_callback)
+            else:
+                self._group_sections_sequential(sections, proximity_threshold, progress_callback)
         else:
             # Group all strings together by proximity
             self.groups = self._group_by_proximity(
@@ -222,36 +233,120 @@ class StringGrouper:
     def _group_by_proximity(self, strings: List[StringInfo],
                            threshold: int, start_group_id: int,
                            section: str) -> List[StringGroup]:
-        """Group strings by proximity in offsets"""
+        """Group strings by proximity in offsets - optimized version"""
         if not strings:
             return []
 
         groups = []
-        current_group = StringGroup(start_group_id, section)
+        current_group_strings = []
+        current_group_start_offset = None
+        current_group_end_offset = None
 
-        for i, string_info in enumerate(strings):
-            if i == 0:
-                current_group.add_string(string_info)
+        for string_info in strings:
+            string_end = string_info.offset + len(string_info.raw_data)
+
+            if not current_group_strings:
+                # First string in group
+                current_group_strings = [string_info]
+                current_group_start_offset = string_info.offset
+                current_group_end_offset = string_end
             else:
-                # Calculate distance from last string in current group
-                last_string = current_group.strings[-1]
-                last_end = last_string.offset + len(last_string.raw_data)
-                distance = string_info.offset - last_end
+                # Check distance from end of current group
+                distance = string_info.offset - current_group_end_offset
 
                 if distance <= threshold:
                     # Add to current group
-                    current_group.add_string(string_info)
+                    current_group_strings.append(string_info)
+                    current_group_end_offset = max(current_group_end_offset, string_end)
                 else:
+                    # Finalize current group and start new one
+                    group = StringGroup(start_group_id + len(groups), section)
+                    group.strings = current_group_strings
+                    group.start_offset = current_group_start_offset
+                    group.end_offset = current_group_end_offset
+                    group.size = current_group_end_offset - current_group_start_offset
+                    group._update_statistics()
+                    groups.append(group)
+
                     # Start new group
-                    groups.append(current_group)
-                    current_group = StringGroup(start_group_id + len(groups), section)
-                    current_group.add_string(string_info)
+                    current_group_strings = [string_info]
+                    current_group_start_offset = string_info.offset
+                    current_group_end_offset = string_end
 
         # Add the last group
-        if current_group.strings:
-            groups.append(current_group)
+        if current_group_strings:
+            group = StringGroup(start_group_id + len(groups), section)
+            group.strings = current_group_strings
+            group.start_offset = current_group_start_offset
+            group.end_offset = current_group_end_offset
+            group.size = current_group_end_offset - current_group_start_offset
+            group._update_statistics()
+            groups.append(group)
 
         return groups
+
+    def _group_sections_sequential(self, sections, proximity_threshold, progress_callback):
+        """Group sections sequentially"""
+        group_id = 0
+        total_sections = len(sections)
+        for i, (section_name, section_strings) in enumerate(sections.items()):
+            if progress_callback:
+                progress = 20 + (i / total_sections) * 40  # 20-60%
+                progress_callback(progress, f"Grouping section: {section_name}")
+
+            section_groups = self._group_by_proximity(
+                section_strings, proximity_threshold, group_id, section_name
+            )
+            self.groups.extend(section_groups)
+            group_id += len(section_groups)
+
+    def _group_sections_parallel(self, sections, proximity_threshold, progress_callback):
+        """Group sections in parallel"""
+        if progress_callback:
+            progress_callback(20, "Starting parallel grouping...")
+
+        # Prepare arguments for worker processes
+        worker_args = []
+        group_id_offset = 0
+        for section_name, section_strings in sections.items():
+            worker_args.append((section_strings, proximity_threshold, group_id_offset, section_name))
+            # Estimate group count for ID offset (rough estimate: strings / 10)
+            group_id_offset += max(1, len(section_strings) // 10)
+
+        # Use ProcessPoolExecutor for parallel processing
+        max_workers = min(multiprocessing.cpu_count(), len(sections))
+        completed_sections = 0
+        all_groups = []
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_section = {
+                executor.submit(_group_strings_worker, args): args[3]
+                for args in worker_args
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_section):
+                section_name = future_to_section[future]
+                try:
+                    section_groups = future.result()
+                    all_groups.extend(section_groups)
+                    completed_sections += 1
+
+                    if progress_callback:
+                        progress = 20 + (completed_sections / len(sections)) * 40
+                        progress_callback(progress, f"Completed grouping: {section_name}")
+
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(20, f"Error grouping {section_name}: {e}")
+
+        # Sort groups by start offset and reassign IDs
+        all_groups.sort(key=lambda g: (g.section, g.start_offset or 0))
+        for i, group in enumerate(all_groups):
+            group.group_id = i
+
+        self.groups = all_groups
 
     def _apply_semantic_grouping(self):
         """Apply semantic grouping to merge groups with similar content"""
