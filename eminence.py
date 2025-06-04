@@ -13,6 +13,8 @@ import unicodedata
 from typing import List, Dict, Tuple, Optional, Set
 import threading
 import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 class ProgressDialog:
     """Progress dialog for long-running operations"""
@@ -1536,9 +1538,68 @@ Other strings in this group:
         """Start the GUI"""
         self.root.mainloop()
 
+def _extract_strings_worker(args):
+    """Worker function for parallel string extraction"""
+    (section_data, base_offset, section_name, min_length,
+     extract_ascii, extract_utf8, extract_utf16le, extract_utf16be) = args
+
+    # Create a temporary extractor for this worker
+    extractor = StringExtractor(min_length)
+    extractor.set_encoding_options(extract_ascii, extract_utf8, extract_utf16le, extract_utf16be)
+
+    # Extract strings from this section
+    return extractor._extract_strings_from_data(section_data, base_offset, section_name)
+
+def _group_strings_worker(args):
+    """Worker function for parallel string grouping"""
+    (section_strings, proximity_threshold, group_id_offset, section_name) = args
+
+    # Create a temporary grouper for this worker
+    grouper = StringGrouper()
+
+    # Group strings by proximity
+    groups = grouper._group_by_proximity(section_strings, proximity_threshold, group_id_offset, section_name)
+
+    return groups
+
+def _analyze_strings_worker(string_chunk):
+    """Worker function for parallel string analysis"""
+    # Create a temporary extractor for analysis methods
+    extractor = StringExtractor()
+
+    analyzed_strings = []
+    for string_info in string_chunk:
+        # Analyze the string
+        string_info.entropy_shannon = extractor._calculate_shannon_entropy(string_info.decoded_string)
+        string_info.entropy_compression = extractor._calculate_compression_entropy(string_info.raw_data)
+        string_info.entropy_ngram = extractor._calculate_ngram_entropy(string_info.decoded_string)
+
+        # Calculate base meaningfulness score
+        base_score = extractor._calculate_meaningfulness_score(string_info.decoded_string)
+
+        # Incorporate entropy into meaningfulness score
+        entropy_bonus = min(string_info.entropy_shannon * 2, 10)
+        compression_bonus = min(string_info.entropy_compression * 1.5, 8)
+        ngram_bonus = min(string_info.entropy_ngram * 1.5, 8)
+
+        # Combine base score with entropy bonuses
+        string_info.meaningfulness_score = base_score + entropy_bonus + compression_bonus + ngram_bonus
+        string_info.category = extractor._categorize_string(string_info.decoded_string)
+
+        analyzed_strings.append(string_info)
+
+    return analyzed_strings
+
 def main():
     """Main entry point"""
     try:
+        # Set multiprocessing start method for better compatibility
+        if hasattr(multiprocessing, 'set_start_method'):
+            try:
+                multiprocessing.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # Already set
+
         app = StringExtractorGUI()
         app.run()
     except Exception as e:
