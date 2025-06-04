@@ -210,15 +210,22 @@ class StringGrouper:
     def group_strings(self, strings: List[StringInfo],
                      proximity_threshold: int = 512,
                      group_by_section: bool = True,
-                     semantic_grouping: bool = True) -> List[StringGroup]:
+                     semantic_grouping: bool = True,
+                     progress_callback=None) -> List[StringGroup]:
         """Group strings based on various criteria"""
         self.groups = []
 
         if not strings:
             return self.groups
 
+        if progress_callback:
+            progress_callback(0, "Sorting strings...")
+
         # Sort strings by section and offset
         sorted_strings = sorted(strings, key=lambda x: (x.section, x.offset))
+
+        if progress_callback:
+            progress_callback(20, "Creating proximity groups...")
 
         if group_by_section:
             # Group by section first, then by proximity within sections
@@ -229,7 +236,12 @@ class StringGrouper:
                 sections[string_info.section].append(string_info)
 
             group_id = 0
-            for section_name, section_strings in sections.items():
+            total_sections = len(sections)
+            for i, (section_name, section_strings) in enumerate(sections.items()):
+                if progress_callback:
+                    progress = 20 + (i / total_sections) * 40  # 20-60%
+                    progress_callback(progress, f"Grouping section: {section_name}")
+
                 section_groups = self._group_by_proximity(
                     section_strings, proximity_threshold, group_id, section_name
                 )
@@ -241,14 +253,23 @@ class StringGrouper:
                 sorted_strings, proximity_threshold, 0, "mixed"
             )
 
+        if progress_callback:
+            progress_callback(70, "Applying semantic grouping...")
+
         # Apply semantic grouping if enabled
         if semantic_grouping:
             self._apply_semantic_grouping()
+
+        if progress_callback:
+            progress_callback(90, "Assigning group IDs...")
 
         # Assign group IDs to strings
         for group in self.groups:
             for string_info in group.strings:
                 string_info.group_id = group.group_id
+
+        if progress_callback:
+            progress_callback(100, "Grouping complete!")
 
         return self.groups
 
@@ -931,12 +952,16 @@ class StringExtractorGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Advanced ELF String Extractor with Grouping")
+
+        # Set a large default size but keep it resizable
         self.root.geometry("1400x900")
+        self.root.minsize(800, 600)  # Set minimum size
 
         self.extractor = StringExtractor()
         self.current_strings = []
         self.current_groups = []
         self.show_grouped = tk.BooleanVar(value=True)
+        self.is_processing = False
 
         self.setup_ui()
 
@@ -1097,10 +1122,18 @@ class StringExtractorGUI:
         self.context_menu.add_command(label="Copy String", command=self.copy_string)
         self.context_menu.add_command(label="Copy Offset", command=self.copy_offset)
 
-        # Status bar
+        # Status bar with integrated progress bar
+        status_frame = ttk.Frame(right_frame)
+        status_frame.pack(fill=tk.X, pady=(5, 0))
+
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(right_frame, textvariable=self.status_var, relief=tk.SUNKEN)
-        status_bar.pack(fill=tk.X, pady=(5, 0))
+        status_label = ttk.Label(status_frame, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # Progress bar (initially hidden)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(status_frame, variable=self.progress_var, maximum=100, length=200)
+        # Don't pack initially - will be shown when needed
 
     def show_context_menu(self, event):
         """Show context menu on right-click"""
@@ -1122,6 +1155,8 @@ class StringExtractorGUI:
             return
 
         string_info = tags[0]
+        if isinstance(string_info, str):
+            return
 
         # Create blacklist dialog with prefilled pattern
         dialog = BlacklistDialog(self.root, self.extractor.blacklist)
@@ -1139,6 +1174,9 @@ class StringExtractorGUI:
             return
 
         string_info = tags[0]
+        if isinstance(string_info, str):
+            return
+
         self.root.clipboard_clear()
         self.root.clipboard_append(string_info.decoded_string)
 
@@ -1154,6 +1192,9 @@ class StringExtractorGUI:
             return
 
         string_info = tags[0]
+        if isinstance(string_info, str):
+            return
+
         self.root.clipboard_clear()
         self.root.clipboard_append(f"0x{string_info.offset:x}")
 
@@ -1164,16 +1205,33 @@ class StringExtractorGUI:
         if self.current_strings:
             self.apply_filters()
 
+    def show_progress(self, show=True):
+        """Show or hide the progress bar"""
+        if show:
+            self.progress_bar.pack(side=tk.RIGHT, padx=(5, 0))
+        else:
+            self.progress_bar.pack_forget()
+        self.root.update_idletasks()
+
+    def update_progress(self, value, status="Processing..."):
+        """Update progress bar and status"""
+        self.progress_var.set(value)
+        self.status_var.set(status)
+        self.root.update_idletasks()
+
     def open_file(self):
         """Open and analyze an ELF file"""
+        if self.is_processing:
+            return
+
         filename = filedialog.askopenfilename(
             title="Select ELF File",
             filetypes=[("ELF files", "*.elf *.so *.o"), ("All files", "*.*")]
         )
 
         if filename:
-            # Create and show progress dialog
-            progress_dialog = ProgressDialog(self.root, "Analyzing ELF File")
+            self.is_processing = True
+            self.show_progress(True)
 
             # Run extraction in a separate thread to keep UI responsive
             def extract_worker():
@@ -1189,31 +1247,45 @@ class StringExtractorGUI:
 
                     # Extract strings with progress reporting
                     self.current_strings = self.extractor.extract_from_elf(
-                        filename, progress_dialog.update_progress
+                        filename, self.update_progress
                     )
 
-                    if not progress_dialog.is_cancelled():
-                        # Update UI in main thread
-                        self.root.after(0, self.update_ui_after_extraction)
+                    # Update UI in main thread
+                    self.root.after(0, self.update_ui_after_extraction)
 
                 except Exception as e:
-                    if not progress_dialog.is_cancelled():
-                        self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to analyze file: {e}"))
-                finally:
-                    self.root.after(0, progress_dialog.close)
-                    self.root.after(0, lambda: self.status_var.set("Ready"))
+                    self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to analyze file: {e}"))
+                    self.root.after(0, self.finish_processing)
 
             threading.Thread(target=extract_worker, daemon=True).start()
 
+    def finish_processing(self):
+        """Clean up after processing is complete"""
+        self.is_processing = False
+        self.show_progress(False)
+        self.status_var.set("Ready")
+
     def update_ui_after_extraction(self):
         """Update UI after string extraction is complete"""
-        # Update filter options
-        self.update_filter_options()
+        def ui_update_worker():
+            try:
+                # Update filter options
+                self.root.after(0, lambda: self.update_progress(95, "Updating filter options..."))
+                self.root.after(0, self.update_filter_options)
 
-        # Display results
-        self.apply_filters()
+                # Display results
+                self.root.after(0, lambda: self.update_progress(98, "Applying filters and displaying results..."))
+                self.root.after(0, self.apply_filters)
 
-        self.status_var.set(f"Extracted {len(self.current_strings)} strings")
+                # Finish
+                self.root.after(0, lambda: self.status_var.set(f"Extracted {len(self.current_strings)} strings"))
+                self.root.after(0, self.finish_processing)
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to update UI: {e}"))
+                self.root.after(0, self.finish_processing)
+
+        threading.Thread(target=ui_update_worker, daemon=True).start()
 
     def update_filter_options(self):
         """Update filter checkboxes based on extracted strings"""
@@ -1257,6 +1329,9 @@ class StringExtractorGUI:
 
     def apply_filters(self, event=None):
         """Apply current filters and update the tree view"""
+        if self.is_processing:
+            return
+
         # Clear tree
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1264,15 +1339,34 @@ class StringExtractorGUI:
         if not self.current_strings:
             return
 
+        # Show progress for filtering operations
+        show_progress = len(self.current_strings) > 1000  # Only show for large datasets
+
+        if show_progress:
+            self.show_progress(True)
+            self.update_progress(0, "Applying blacklist filters...")
+
         # Apply blacklist filtering to current strings
         blacklist_filtered = []
-        for string_info in self.current_strings:
+        total_strings = len(self.current_strings)
+        for i, string_info in enumerate(self.current_strings):
+            if show_progress and i % 500 == 0:
+                progress = (i / total_strings) * 30  # 0-30% for blacklist filtering
+                self.update_progress(progress, f"Applying blacklist filters... ({i}/{total_strings})")
+
             if not self.extractor.blacklist.is_blacklisted(string_info.decoded_string):
                 blacklist_filtered.append(string_info)
 
+        if show_progress:
+            self.update_progress(35, "Applying UI filters...")
+
         # Filter strings by UI filters
         filtered_strings = []
-        for string_info in blacklist_filtered:
+        for i, string_info in enumerate(blacklist_filtered):
+            if show_progress and i % 500 == 0:
+                progress = 35 + (i / len(blacklist_filtered)) * 25  # 35-60% for UI filtering
+                self.update_progress(progress, f"Applying UI filters... ({i}/{len(blacklist_filtered)})")
+
             # Check section filter
             if string_info.section in self.section_vars and not self.section_vars[string_info.section].get():
                 continue
@@ -1289,6 +1383,9 @@ class StringExtractorGUI:
 
         # Group strings if enabled
         if self.show_grouped.get() and filtered_strings:
+            if show_progress:
+                self.update_progress(65, "Grouping strings...")
+
             # Create temporary grouper with filtered strings
             temp_grouper = StringGrouper()
             self.current_groups = temp_grouper.group_strings(
@@ -1298,14 +1395,41 @@ class StringExtractorGUI:
                 semantic_grouping=self.semantic_grouping_var.get()
             )
 
+            if show_progress:
+                self.update_progress(85, "Populating grouped view...")
+
             self._populate_grouped_tree(self.current_groups)
         else:
+            if show_progress:
+                self.update_progress(85, "Populating flat view...")
+
             self._populate_flat_tree(filtered_strings)
+
+        if show_progress:
+            self.update_progress(100, "Complete!")
+            # Hide progress bar after a short delay
+            self.root.after(500, lambda: self.show_progress(False))
 
     def _populate_grouped_tree(self, groups):
         """Populate tree with grouped strings"""
-        # Sort groups by start offset
-        groups.sort(key=lambda g: g.start_offset or 0)
+        # Sort groups based on selected sort criteria
+        sort_key = self.sort_var.get().lower()
+        if sort_key == "offset":
+            groups.sort(key=lambda g: g.start_offset or 0)
+        elif sort_key == "length":
+            groups.sort(key=lambda g: sum(s.length for s in g.strings), reverse=True)
+        elif sort_key == "shannon entropy":
+            groups.sort(key=lambda g: g.avg_shannon_entropy, reverse=True)
+        elif sort_key == "compression entropy":
+            groups.sort(key=lambda g: g.avg_compression_entropy, reverse=True)
+        elif sort_key == "n-gram entropy":
+            groups.sort(key=lambda g: g.avg_ngram_entropy, reverse=True)
+        elif sort_key == "meaningfulness":
+            groups.sort(key=lambda g: g.avg_meaningfulness, reverse=True)
+        elif sort_key == "group":
+            groups.sort(key=lambda g: g.group_id)
+        else:
+            groups.sort(key=lambda g: g.start_offset or 0)
 
         for group in groups:
             # Create group header
@@ -1317,9 +1441,9 @@ class StringExtractorGUI:
                     "mixed" if len(set(s.encoding for s in group.strings)) > 1 else group.strings[0].encoding,
                     group.dominant_category,
                     f"{group.size} bytes",
-                    "",
-                    "",
-                    "",
+                    f"{group.avg_shannon_entropy:.2f}",
+                    f"{group.avg_compression_entropy:.2f}",
+                    f"{group.avg_ngram_entropy:.2f}",
                     f"{group.avg_meaningfulness:.1f}",
                     str(group.group_id)
                 ),
@@ -1370,7 +1494,8 @@ class StringExtractorGUI:
         # Update status
         total_strings = sum(len(g.strings) for g in groups)
         blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
-        self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings ({blacklisted_count} blacklisted)")
+        if not self.is_processing:
+            self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings ({blacklisted_count} blacklisted)")
 
     def _populate_flat_tree(self, filtered_strings):
         """Populate tree with flat string list"""
@@ -1417,7 +1542,8 @@ class StringExtractorGUI:
 
         # Update status
         blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
-        self.status_var.set(f"Showing {len(filtered_strings)} strings ({blacklisted_count} blacklisted)")
+        if not self.is_processing:
+            self.status_var.set(f"Showing {len(filtered_strings)} strings ({blacklisted_count} blacklisted)")
 
     def show_string_details(self, event):
         """Show detailed information about selected string"""
@@ -1431,6 +1557,8 @@ class StringExtractorGUI:
             return
 
         string_info = tags[0]
+        if isinstance(string_info, str):
+            return
 
         # Create detail window
         detail_window = tk.Toplevel(self.root)
