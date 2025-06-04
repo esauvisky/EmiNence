@@ -337,21 +337,53 @@ class StringExtractor:
         self.sections_data = {}
         self.strings = []
         self.grouper = StringGrouper()
+        self.blacklist = BlacklistManager()
 
-    def extract_from_elf(self, filepath: str) -> List[StringInfo]:
-        """Extract strings from ELF file"""
+        # Encoding settings (ASCII enabled by default, UTF disabled)
+        self.extract_ascii = True
+        self.extract_utf8 = False
+        self.extract_utf16le = False
+        self.extract_utf16be = False
+
+    def set_encoding_options(self, ascii=True, utf8=False, utf16le=False, utf16be=False):
+        """Set which encodings to extract"""
+        self.extract_ascii = ascii
+        self.extract_utf8 = utf8
+        self.extract_utf16le = utf16le
+        self.extract_utf16be = utf16be
+
+    def extract_from_elf(self, filepath: str, progress_callback=None) -> List[StringInfo]:
+        """Extract strings from ELF file with progress reporting"""
         self.strings = []
 
         try:
             with open(filepath, 'rb') as f:
                 elf = ELFFile(f)
 
+                # Get all sections first for progress calculation
+                sections = list(elf.iter_sections())
+                total_sections = len([s for s in sections if s.data_size > 0])
+                processed_sections = 0
+
+                if progress_callback:
+                    progress_callback(0, "Reading ELF sections...")
+
                 # Extract section data
-                for section in elf.iter_sections():
+                for section in sections:
                     if section.data_size > 0:
                         section_data = section.data()
                         section_name = section.name
                         base_offset = section['sh_offset']
+
+                        if progress_callback:
+                            status = f"Processing section: {section_name}"
+                            progress = (processed_sections / total_sections) * 80  # 80% for extraction
+                            progress_callback(progress, status)
+
+                            # Check for cancellation
+                            if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
+                                if progress_callback.__self__.is_cancelled():
+                                    return []
 
                         # Extract strings from this section
                         section_strings = self._extract_strings_from_data(
@@ -359,13 +391,57 @@ class StringExtractor:
                         )
                         self.strings.extend(section_strings)
 
+                        processed_sections += 1
+
+                if progress_callback:
+                    progress_callback(80, "Removing duplicates...")
+
+                # Remove duplicates
+                self._remove_duplicates()
+
+                if progress_callback:
+                    progress_callback(85, "Applying blacklist...")
+
+                # Apply blacklist
+                self._apply_blacklist()
+
+                if progress_callback:
+                    progress_callback(90, "Analyzing strings...")
+
+                # Analyze all extracted strings
+                self._analyze_strings(progress_callback)
+
         except (ELFError, Exception) as e:
             raise Exception(f"Error parsing ELF file: {e}")
 
-        # Analyze all extracted strings
-        self._analyze_strings()
+        if progress_callback:
+            progress_callback(100, "Complete!")
 
         return self.strings
+
+    def _remove_duplicates(self):
+        """Remove duplicate strings based on decoded content"""
+        seen = set()
+        unique_strings = []
+
+        for string_info in self.strings:
+            # Use decoded string + section as key to avoid false positives
+            key = (string_info.decoded_string, string_info.section)
+            if key not in seen:
+                seen.add(key)
+                unique_strings.append(string_info)
+
+        self.strings = unique_strings
+
+    def _apply_blacklist(self):
+        """Apply blacklist filtering"""
+        filtered_strings = []
+
+        for string_info in self.strings:
+            if not self.blacklist.is_blacklisted(string_info.decoded_string):
+                filtered_strings.append(string_info)
+
+        self.strings = filtered_strings
 
     def group_strings(self, proximity_threshold: int = 512,
                      group_by_section: bool = True,
@@ -375,19 +451,24 @@ class StringExtractor:
             self.strings, proximity_threshold, group_by_section, semantic_grouping
         )
 
-    # ... (keeping all the existing string extraction methods unchanged)
     def _extract_strings_from_data(self, data: bytes, base_offset: int, section: str) -> List[StringInfo]:
-        """Extract strings from binary data using multiple encoding strategies"""
+        """Extract strings from binary data using selected encoding strategies"""
         strings = []
 
         # ASCII strings
-        strings.extend(self._find_ascii_strings(data, base_offset, section))
+        if self.extract_ascii:
+            strings.extend(self._find_ascii_strings(data, base_offset, section))
 
         # UTF-8 strings
-        strings.extend(self._find_utf8_strings(data, base_offset, section))
+        if self.extract_utf8:
+            strings.extend(self._find_utf8_strings(data, base_offset, section))
 
-        # UTF-16 strings (both little and big endian)
-        strings.extend(self._find_utf16_strings(data, base_offset, section))
+        # UTF-16 strings
+        if self.extract_utf16le:
+            strings.extend(self._find_utf16_encoding(data, base_offset, section, 'utf-16le'))
+
+        if self.extract_utf16be:
+            strings.extend(self._find_utf16_encoding(data, base_offset, section, 'utf-16be'))
 
         return strings
 
@@ -495,18 +576,6 @@ class StringExtractor:
 
         return strings
 
-    def _find_utf16_strings(self, data: bytes, base_offset: int, section: str) -> List[StringInfo]:
-        """Find UTF-16 strings (both LE and BE)"""
-        strings = []
-
-        # UTF-16 LE
-        strings.extend(self._find_utf16_encoding(data, base_offset, section, 'utf-16le'))
-
-        # UTF-16 BE
-        strings.extend(self._find_utf16_encoding(data, base_offset, section, 'utf-16be'))
-
-        return strings
-
     def _find_utf16_encoding(self, data: bytes, base_offset: int, section: str, encoding: str) -> List[StringInfo]:
         """Find UTF-16 strings for specific endianness"""
         strings = []
@@ -572,9 +641,20 @@ class StringExtractor:
 
         return True
 
-    def _analyze_strings(self):
-        """Analyze all extracted strings"""
-        for string_info in self.strings:
+    def _analyze_strings(self, progress_callback=None):
+        """Analyze all extracted strings with progress reporting"""
+        total_strings = len(self.strings)
+
+        for i, string_info in enumerate(self.strings):
+            if progress_callback and i % 100 == 0:  # Update every 100 strings
+                progress = 90 + (i / total_strings) * 10  # 90-100% range
+                progress_callback(progress, f"Analyzing strings... ({i}/{total_strings})")
+
+                # Check for cancellation
+                if hasattr(progress_callback, '__self__') and hasattr(progress_callback.__self__, 'is_cancelled'):
+                    if progress_callback.__self__.is_cancelled():
+                        return
+
             string_info.entropy_shannon = self._calculate_shannon_entropy(string_info.decoded_string)
             string_info.entropy_compression = self._calculate_compression_entropy(string_info.raw_data)
             string_info.entropy_ngram = self._calculate_ngram_entropy(string_info.decoded_string)
@@ -711,6 +791,114 @@ class StringExtractor:
 
         return 'Other'
 
+class BlacklistDialog:
+    """Dialog for managing blacklist entries"""
+
+    def __init__(self, parent, blacklist_manager):
+        self.parent = parent
+        self.blacklist = blacklist_manager
+        self.result = None
+
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Manage Blacklist")
+        self.dialog.geometry("600x400")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        self.setup_ui()
+        self.refresh_list()
+
+    def setup_ui(self):
+        """Set up the dialog UI"""
+        # Main frame
+        main_frame = ttk.Frame(self.dialog)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Add entry frame
+        add_frame = ttk.LabelFrame(main_frame, text="Add New Entry")
+        add_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Pattern entry
+        ttk.Label(add_frame, text="Pattern:").pack(anchor=tk.W, padx=5, pady=(5, 0))
+        self.pattern_var = tk.StringVar()
+        self.pattern_entry = ttk.Entry(add_frame, textvariable=self.pattern_var)
+        self.pattern_entry.pack(fill=tk.X, padx=5, pady=2)
+
+        # Regex checkbox
+        self.is_regex_var = tk.BooleanVar()
+        ttk.Checkbutton(add_frame, text="Regular Expression", variable=self.is_regex_var).pack(anchor=tk.W, padx=5, pady=2)
+
+        # Add button
+        ttk.Button(add_frame, text="Add", command=self.add_entry).pack(anchor=tk.W, padx=5, pady=5)
+
+        # Existing entries frame
+        list_frame = ttk.LabelFrame(main_frame, text="Current Entries")
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Listbox with scrollbar
+        list_container = ttk.Frame(list_frame)
+        list_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.listbox = tk.Listbox(list_container)
+        list_scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=list_scrollbar.set)
+
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Buttons frame
+        buttons_frame = ttk.Frame(list_frame)
+        buttons_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(buttons_frame, text="Remove Selected", command=self.remove_entry).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(buttons_frame, text="Clear All", command=self.clear_all).pack(side=tk.LEFT)
+
+        # Bottom buttons
+        bottom_frame = ttk.Frame(main_frame)
+        bottom_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(bottom_frame, text="Close", command=self.dialog.destroy).pack(side=tk.RIGHT)
+
+        # Bind Enter key to add entry
+        self.pattern_entry.bind('<Return>', lambda e: self.add_entry())
+
+    def add_entry(self):
+        """Add a new blacklist entry"""
+        pattern = self.pattern_var.get().strip()
+        if pattern:
+            self.blacklist.add_entry(pattern, self.is_regex_var.get())
+            self.pattern_var.set("")
+            self.is_regex_var.set(False)
+            self.refresh_list()
+
+    def remove_entry(self):
+        """Remove selected blacklist entry"""
+        selection = self.listbox.curselection()
+        if selection:
+            index = selection[0]
+            self.blacklist.remove_entry(index)
+            self.refresh_list()
+
+    def clear_all(self):
+        """Clear all blacklist entries"""
+        if messagebox.askyesno("Confirm", "Clear all blacklist entries?"):
+            self.blacklist.entries.clear()
+            self.blacklist._rebuild_regexes()
+            self.refresh_list()
+
+    def refresh_list(self):
+        """Refresh the listbox with current entries"""
+        self.listbox.delete(0, tk.END)
+        for entry in self.blacklist.get_entries():
+            prefix = "[REGEX] " if entry["is_regex"] else "[TEXT] "
+            self.listbox.insert(tk.END, prefix + entry["pattern"])
+
+    def set_initial_pattern(self, pattern: str):
+        """Set initial pattern for the dialog"""
+        self.pattern_var.set(pattern)
+        self.pattern_entry.focus_set()
+        self.pattern_entry.select_range(0, tk.END)
+
 class StringExtractorGUI:
     """GUI for the string extractor tool"""
 
@@ -738,6 +926,10 @@ class StringExtractorGUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Manage Blacklist", command=self.show_blacklist_dialog)
+
         # Main frame
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -752,6 +944,20 @@ class StringExtractorGUI:
         self.min_length_var = tk.IntVar(value=4)
         min_length_spin = ttk.Spinbox(left_frame, from_=1, to=50, textvariable=self.min_length_var, width=10)
         min_length_spin.pack(anchor=tk.W, padx=5, pady=2)
+
+        # Encoding options
+        encoding_frame = ttk.LabelFrame(left_frame, text="Encoding Options")
+        encoding_frame.pack(fill=tk.X, padx=5, pady=10)
+
+        self.extract_ascii_var = tk.BooleanVar(value=True)
+        self.extract_utf8_var = tk.BooleanVar(value=False)
+        self.extract_utf16le_var = tk.BooleanVar(value=False)
+        self.extract_utf16be_var = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(encoding_frame, text="ASCII", variable=self.extract_ascii_var).pack(anchor=tk.W, padx=5, pady=2)
+        ttk.Checkbutton(encoding_frame, text="UTF-8", variable=self.extract_utf8_var).pack(anchor=tk.W, padx=5, pady=2)
+        ttk.Checkbutton(encoding_frame, text="UTF-16 LE", variable=self.extract_utf16le_var).pack(anchor=tk.W, padx=5, pady=2)
+        ttk.Checkbutton(encoding_frame, text="UTF-16 BE", variable=self.extract_utf16be_var).pack(anchor=tk.W, padx=5, pady=2)
 
         # Grouping options
         grouping_frame = ttk.LabelFrame(left_frame, text="Grouping Options")
@@ -855,13 +1061,82 @@ class StringExtractorGUI:
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Bind double-click for detail view
+        # Bind events
         self.tree.bind("<Double-1>", self.show_string_details)
+        self.tree.bind("<Button-3>", self.show_context_menu)  # Right-click
+
+        # Create context menu
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Add to Blacklist", command=self.add_to_blacklist)
+        self.context_menu.add_command(label="Copy String", command=self.copy_string)
+        self.context_menu.add_command(label="Copy Offset", command=self.copy_offset)
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
         status_bar = ttk.Label(right_frame, textvariable=self.status_var, relief=tk.SUNKEN)
         status_bar.pack(fill=tk.X, pady=(5, 0))
+
+    def show_context_menu(self, event):
+        """Show context menu on right-click"""
+        # Select the item under cursor
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def add_to_blacklist(self):
+        """Add selected string to blacklist"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = selection[0]
+        tags = self.tree.item(item, "tags")
+        if not tags or tags[0] == "group_header":
+            return
+
+        string_info: StringInfo = tags[0] # type: ignore
+
+        # Create blacklist dialog with prefilled pattern
+        dialog = BlacklistDialog(self.root, self.extractor.blacklist)
+        dialog.set_initial_pattern(string_info.decoded_string)
+
+    def copy_string(self):
+        """Copy selected string to clipboard"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = selection[0]
+        tags = self.tree.item(item, "tags")
+        if not tags or tags[0] == "group_header":
+            return
+
+        string_info: StringInfo = tags[0] # type: ignore
+        self.root.clipboard_clear()
+        self.root.clipboard_append(string_info.decoded_string)
+
+    def copy_offset(self):
+        """Copy selected string offset to clipboard"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = selection[0]
+        tags = self.tree.item(item, "tags")
+        if not tags or tags[0] == "group_header":
+            return
+
+        string_info: StringInfo = tags[0] # type: ignore
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f"0x{string_info.offset:x}")
+
+    def show_blacklist_dialog(self):
+        """Show blacklist management dialog"""
+        BlacklistDialog(self.root, self.extractor.blacklist)
+        # Refresh the view to apply any blacklist changes
+        if self.current_strings:
+            self.apply_filters()
 
     def open_file(self):
         """Open and analyze an ELF file"""
@@ -871,20 +1146,35 @@ class StringExtractorGUI:
         )
 
         if filename:
-            self.status_var.set("Analyzing file...")
-            self.root.update()
+            # Create and show progress dialog
+            progress_dialog = ProgressDialog(self.root, "Analyzing ELF File")
 
             # Run extraction in a separate thread to keep UI responsive
             def extract_worker():
                 try:
+                    # Set extraction options
                     self.extractor.min_length = self.min_length_var.get()
-                    self.current_strings = self.extractor.extract_from_elf(filename)
+                    self.extractor.set_encoding_options(
+                        ascii=self.extract_ascii_var.get(),
+                        utf8=self.extract_utf8_var.get(),
+                        utf16le=self.extract_utf16le_var.get(),
+                        utf16be=self.extract_utf16be_var.get()
+                    )
 
-                    # Update UI in main thread
-                    self.root.after(0, self.update_ui_after_extraction)
+                    # Extract strings with progress reporting
+                    self.current_strings = self.extractor.extract_from_elf(
+                        filename, progress_dialog.update_progress
+                    )
+
+                    if not progress_dialog.is_cancelled():
+                        # Update UI in main thread
+                        self.root.after(0, self.update_ui_after_extraction)
 
                 except Exception as e:
-                    self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to analyze file: {e}"))
+                    if not progress_dialog.is_cancelled():
+                        self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to analyze file: {e}"))
+                finally:
+                    self.root.after(0, progress_dialog.close)
                     self.root.after(0, lambda: self.status_var.set("Ready"))
 
             threading.Thread(target=extract_worker, daemon=True).start()
@@ -945,9 +1235,18 @@ class StringExtractorGUI:
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # Filter strings
-        filtered_strings = []
+        if not self.current_strings:
+            return
+
+        # Apply blacklist filtering to current strings
+        blacklist_filtered = []
         for string_info in self.current_strings:
+            if not self.extractor.blacklist.is_blacklisted(string_info.decoded_string):
+                blacklist_filtered.append(string_info)
+
+        # Filter strings by UI filters
+        filtered_strings = []
+        for string_info in blacklist_filtered:
             # Check section filter
             if string_info.section in self.section_vars and not self.section_vars[string_info.section].get():
                 continue
@@ -964,26 +1263,16 @@ class StringExtractorGUI:
 
         # Group strings if enabled
         if self.show_grouped.get() and filtered_strings:
-            self.current_groups = self.extractor.group_strings(
+            # Create temporary grouper with filtered strings
+            temp_grouper = StringGrouper()
+            self.current_groups = temp_grouper.group_strings(
+                filtered_strings,
                 proximity_threshold=self.proximity_threshold_var.get(),
                 group_by_section=self.group_by_section_var.get(),
                 semantic_grouping=self.semantic_grouping_var.get()
             )
 
-            # Filter groups to only include strings that passed the filter
-            filtered_group_strings = set(filtered_strings)
-            display_groups = []
-
-            for group in self.current_groups:
-                group_filtered_strings = [s for s in group.strings if s in filtered_group_strings]
-                if group_filtered_strings:
-                    # Create a new group with only filtered strings
-                    filtered_group = StringGroup(group.group_id, group.section)
-                    for s in group_filtered_strings:
-                        filtered_group.add_string(s)
-                    display_groups.append(filtered_group)
-
-            self._populate_grouped_tree(display_groups)
+            self._populate_grouped_tree(self.current_groups)
         else:
             self._populate_flat_tree(filtered_strings)
 
@@ -1054,7 +1343,8 @@ class StringExtractorGUI:
 
         # Update status
         total_strings = sum(len(g.strings) for g in groups)
-        self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings")
+        blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
+        self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings ({blacklisted_count} blacklisted)")
 
     def _populate_flat_tree(self, filtered_strings):
         """Populate tree with flat string list"""
@@ -1100,7 +1390,8 @@ class StringExtractorGUI:
             )
 
         # Update status
-        self.status_var.set(f"Showing {len(filtered_strings)} strings")
+        blacklisted_count = len(self.current_strings) - len([s for s in self.current_strings if not self.extractor.blacklist.is_blacklisted(s.decoded_string)])
+        self.status_var.set(f"Showing {len(filtered_strings)} strings ({blacklisted_count} blacklisted)")
 
     def show_string_details(self, event):
         """Show detailed information about selected string"""
@@ -1113,7 +1404,7 @@ class StringExtractorGUI:
         if not tags or tags[0] == "group_header":
             return
 
-        string_info = tags[0]
+        string_info: StringInfo = tags[0] # type: ignore
 
         # Create detail window
         detail_window = tk.Toplevel(self.root)
