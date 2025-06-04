@@ -1095,7 +1095,7 @@ class StringExtractorGUI:
         if not tags or tags[0] == "group_header":
             return
 
-        string_info: StringInfo = tags[0] # type: ignore
+        string_info = tags[0]
 
         # Create blacklist dialog with prefilled pattern
         dialog = BlacklistDialog(self.root, self.extractor.blacklist)
@@ -1112,7 +1112,7 @@ class StringExtractorGUI:
         if not tags or tags[0] == "group_header":
             return
 
-        string_info: StringInfo = tags[0] # type: ignore
+        string_info = tags[0]
         self.root.clipboard_clear()
         self.root.clipboard_append(string_info.decoded_string)
 
@@ -1127,7 +1127,7 @@ class StringExtractorGUI:
         if not tags or tags[0] == "group_header":
             return
 
-        string_info: StringInfo = tags[0] # type: ignore
+        string_info = tags[0]
         self.root.clipboard_clear()
         self.root.clipboard_append(f"0x{string_info.offset:x}")
 
@@ -1404,7 +1404,7 @@ class StringExtractorGUI:
         if not tags or tags[0] == "group_header":
             return
 
-        string_info: StringInfo = tags[0] # type: ignore
+        string_info = tags[0]
 
         # Create detail window
         detail_window = tk.Toplevel(self.root)
