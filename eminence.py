@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import struct
@@ -13,6 +12,51 @@ from elftools.common.exceptions import ELFError
 import unicodedata
 from typing import List, Dict, Tuple, Optional
 import threading
+
+class StringGroup:
+    """Container for a group of related strings"""
+    def __init__(self, group_id: int, section: str):
+        self.group_id = group_id
+        self.section = section
+        self.strings = []
+        self.start_offset = None
+        self.end_offset = None
+        self.size = 0
+        self.avg_meaningfulness = 0.0
+        self.dominant_category = None
+
+    def add_string(self, string_info):
+        """Add a string to this group"""
+        self.strings.append(string_info)
+
+        if self.start_offset is None or string_info.offset < self.start_offset:
+            self.start_offset = string_info.offset
+
+        string_end = string_info.offset + len(string_info.raw_data)
+        if self.end_offset is None or string_end > self.end_offset:
+            self.end_offset = string_end
+
+        self.size = self.end_offset - self.start_offset if self.start_offset and self.end_offset else 0
+
+        # Update statistics
+        self._update_statistics()
+
+    def _update_statistics(self):
+        """Update group statistics"""
+        if not self.strings:
+            return
+
+        # Average meaningfulness
+        self.avg_meaningfulness = sum(s.meaningfulness_score for s in self.strings) / len(self.strings)
+
+        # Dominant category
+        categories = [s.category for s in self.strings]
+        category_counts = Counter(categories)
+        self.dominant_category = category_counts.most_common(1)[0][0] if category_counts else "Mixed"
+
+    def get_summary(self) -> str:
+        """Get a summary description of this group"""
+        return f"Group {self.group_id}: {len(self.strings)} strings, {self.dominant_category}, avg score: {self.avg_meaningfulness:.1f}"
 
 class StringInfo:
     """Container for string information"""
@@ -28,6 +72,7 @@ class StringInfo:
         self.entropy_compression = 0.0
         self.entropy_ngram = 0.0
         self.meaningfulness_score = 0.0
+        self.group_id = None  # Will be assigned during grouping
 
     def _decode_string(self) -> str:
         """Safely decode the string"""
@@ -43,6 +88,142 @@ class StringInfo:
         except:
             return repr(self.raw_data)[2:-1]  # fallback to repr
 
+class StringGrouper:
+    """Handles grouping of strings by proximity and other criteria"""
+
+    def __init__(self):
+        self.groups = []
+
+    def group_strings(self, strings: List[StringInfo],
+                     proximity_threshold: int = 512,
+                     group_by_section: bool = True,
+                     semantic_grouping: bool = True) -> List[StringGroup]:
+        """Group strings based on various criteria"""
+        self.groups = []
+
+        if not strings:
+            return self.groups
+
+        # Sort strings by section and offset
+        sorted_strings = sorted(strings, key=lambda x: (x.section, x.offset))
+
+        if group_by_section:
+            # Group by section first, then by proximity within sections
+            sections = {}
+            for string_info in sorted_strings:
+                if string_info.section not in sections:
+                    sections[string_info.section] = []
+                sections[string_info.section].append(string_info)
+
+            group_id = 0
+            for section_name, section_strings in sections.items():
+                section_groups = self._group_by_proximity(
+                    section_strings, proximity_threshold, group_id, section_name
+                )
+                self.groups.extend(section_groups)
+                group_id += len(section_groups)
+        else:
+            # Group all strings together by proximity
+            self.groups = self._group_by_proximity(
+                sorted_strings, proximity_threshold, 0, "mixed"
+            )
+
+        # Apply semantic grouping if enabled
+        if semantic_grouping:
+            self._apply_semantic_grouping()
+
+        # Assign group IDs to strings
+        for group in self.groups:
+            for string_info in group.strings:
+                string_info.group_id = group.group_id
+
+        return self.groups
+
+    def _group_by_proximity(self, strings: List[StringInfo],
+                           threshold: int, start_group_id: int,
+                           section: str) -> List[StringGroup]:
+        """Group strings by proximity in offsets"""
+        if not strings:
+            return []
+
+        groups = []
+        current_group = StringGroup(start_group_id, section)
+
+        for i, string_info in enumerate(strings):
+            if i == 0:
+                current_group.add_string(string_info)
+            else:
+                # Calculate distance from last string in current group
+                last_string = current_group.strings[-1]
+                last_end = last_string.offset + len(last_string.raw_data)
+                distance = string_info.offset - last_end
+
+                if distance <= threshold:
+                    # Add to current group
+                    current_group.add_string(string_info)
+                else:
+                    # Start new group
+                    groups.append(current_group)
+                    current_group = StringGroup(start_group_id + len(groups), section)
+                    current_group.add_string(string_info)
+
+        # Add the last group
+        if current_group.strings:
+            groups.append(current_group)
+
+        return groups
+
+    def _apply_semantic_grouping(self):
+        """Apply semantic grouping to merge groups with similar content"""
+        # This could merge groups that have similar categories, similar meaningfulness scores, etc.
+        # For now, we'll implement a simple category-based merging
+
+        category_groups = defaultdict(list)
+
+        # Group by dominant category
+        for group in self.groups:
+            if len(group.strings) < 3:  # Only merge small groups
+                category_groups[group.dominant_category].append(group)
+
+        # Merge groups with same category if they're close enough
+        for category, cat_groups in category_groups.items():
+            if len(cat_groups) > 1:
+                # Sort by start offset
+                cat_groups.sort(key=lambda g: g.start_offset)
+
+                merged_groups = []
+                i = 0
+                while i < len(cat_groups):
+                    current_group = cat_groups[i]
+
+                    # Try to merge with next groups
+                    j = i + 1
+                    while j < len(cat_groups):
+                        next_group = cat_groups[j]
+
+                        # Check if groups are close enough to merge (within 2KB)
+                        if next_group.start_offset - current_group.end_offset <= 2048:
+                            # Merge groups
+                            for string_info in next_group.strings:
+                                current_group.add_string(string_info)
+                            j += 1
+                        else:
+                            break
+
+                    merged_groups.append(current_group)
+                    i = j
+
+                # Replace original groups with merged ones
+                for old_group in cat_groups:
+                    if old_group in self.groups:
+                        self.groups.remove(old_group)
+
+                self.groups.extend(merged_groups)
+
+        # Re-assign group IDs
+        for i, group in enumerate(self.groups):
+            group.group_id = i
+
 class StringExtractor:
     """Main string extraction and analysis engine"""
 
@@ -50,6 +231,7 @@ class StringExtractor:
         self.min_length = min_length
         self.sections_data = {}
         self.strings = []
+        self.grouper = StringGrouper()
 
     def extract_from_elf(self, filepath: str) -> List[StringInfo]:
         """Extract strings from ELF file"""
@@ -80,6 +262,15 @@ class StringExtractor:
 
         return self.strings
 
+    def group_strings(self, proximity_threshold: int = 512,
+                     group_by_section: bool = True,
+                     semantic_grouping: bool = True) -> List[StringGroup]:
+        """Group the extracted strings"""
+        return self.grouper.group_strings(
+            self.strings, proximity_threshold, group_by_section, semantic_grouping
+        )
+
+    # ... (keeping all the existing string extraction methods unchanged)
     def _extract_strings_from_data(self, data: bytes, base_offset: int, section: str) -> List[StringInfo]:
         """Extract strings from binary data using multiple encoding strategies"""
         strings = []
@@ -420,11 +611,13 @@ class StringExtractorGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Advanced ELF String Extractor")
-        self.root.geometry("1200x800")
+        self.root.title("Advanced ELF String Extractor with Grouping")
+        self.root.geometry("1400x900")
 
         self.extractor = StringExtractor()
         self.current_strings = []
+        self.current_groups = []
+        self.show_grouped = tk.BooleanVar(value=True)
 
         self.setup_ui()
 
@@ -445,7 +638,7 @@ class StringExtractorGUI:
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # Left panel - filters and options
-        left_frame = ttk.LabelFrame(main_frame, text="Filters & Options", width=300)
+        left_frame = ttk.LabelFrame(main_frame, text="Filters & Options", width=350)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 5))
         left_frame.pack_propagate(False)
 
@@ -454,6 +647,31 @@ class StringExtractorGUI:
         self.min_length_var = tk.IntVar(value=4)
         min_length_spin = ttk.Spinbox(left_frame, from_=1, to=50, textvariable=self.min_length_var, width=10)
         min_length_spin.pack(anchor=tk.W, padx=5, pady=2)
+
+        # Grouping options
+        grouping_frame = ttk.LabelFrame(left_frame, text="Grouping Options")
+        grouping_frame.pack(fill=tk.X, padx=5, pady=10)
+
+        # Enable grouping checkbox
+        ttk.Checkbutton(grouping_frame, text="Enable Grouping",
+                       variable=self.show_grouped, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
+
+        # Proximity threshold
+        ttk.Label(grouping_frame, text="Proximity Threshold (bytes):").pack(anchor=tk.W, padx=5, pady=2)
+        self.proximity_threshold_var = tk.IntVar(value=512)
+        proximity_spin = ttk.Spinbox(grouping_frame, from_=64, to=4096, textvariable=self.proximity_threshold_var, width=10)
+        proximity_spin.pack(anchor=tk.W, padx=5, pady=2)
+        proximity_spin.bind('<Return>', lambda e: self.apply_filters())
+
+        # Group by section
+        self.group_by_section_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(grouping_frame, text="Group by Section",
+                       variable=self.group_by_section_var, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
+
+        # Semantic grouping
+        self.semantic_grouping_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(grouping_frame, text="Semantic Grouping",
+                       variable=self.semantic_grouping_var, command=self.apply_filters).pack(anchor=tk.W, padx=5, pady=2)
 
         # Section filter
         ttk.Label(left_frame, text="Sections:").pack(anchor=tk.W, padx=5, pady=(10, 2))
@@ -476,7 +694,7 @@ class StringExtractorGUI:
         # Sort options
         ttk.Label(left_frame, text="Sort by:").pack(anchor=tk.W, padx=5, pady=(10, 2))
         self.sort_var = tk.StringVar(value="offset")
-        sort_options = ["Offset", "Length", "Shannon Entropy", "Compression Entropy", "N-gram Entropy", "Meaningfulness"]
+        sort_options = ["Offset", "Length", "Shannon Entropy", "Compression Entropy", "N-gram Entropy", "Meaningfulness", "Group"]
         sort_combo = ttk.Combobox(left_frame, textvariable=self.sort_var, values=sort_options, state="readonly")
         sort_combo.pack(fill=tk.X, padx=5, pady=2)
         sort_combo.bind('<<ComboboxSelected>>', self.apply_filters)
@@ -496,7 +714,7 @@ class StringExtractorGUI:
         tree_container = ttk.Frame(tree_frame)
         tree_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.tree = ttk.Treeview(tree_container, columns=("offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning"), show="tree headings")
+        self.tree = ttk.Treeview(tree_container, columns=("offset", "section", "encoding", "category", "length", "shannon", "compression", "ngram", "meaning", "group"), show="tree headings")
 
         # Configure columns
         self.tree.heading("#0", text="String")
@@ -509,6 +727,7 @@ class StringExtractorGUI:
         self.tree.heading("compression", text="Compression")
         self.tree.heading("ngram", text="N-gram")
         self.tree.heading("meaning", text="Meaning")
+        self.tree.heading("group", text="Group")
 
         self.tree.column("#0", width=300)
         self.tree.column("offset", width=80)
@@ -520,6 +739,7 @@ class StringExtractorGUI:
         self.tree.column("compression", width=90)
         self.tree.column("ngram", width=70)
         self.tree.column("meaning", width=70)
+        self.tree.column("group", width=60)
 
         # Scrollbars
         v_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.tree.yview)
@@ -637,6 +857,102 @@ class StringExtractorGUI:
 
             filtered_strings.append(string_info)
 
+        # Group strings if enabled
+        if self.show_grouped.get() and filtered_strings:
+            self.current_groups = self.extractor.group_strings(
+                proximity_threshold=self.proximity_threshold_var.get(),
+                group_by_section=self.group_by_section_var.get(),
+                semantic_grouping=self.semantic_grouping_var.get()
+            )
+
+            # Filter groups to only include strings that passed the filter
+            filtered_group_strings = set(filtered_strings)
+            display_groups = []
+
+            for group in self.current_groups:
+                group_filtered_strings = [s for s in group.strings if s in filtered_group_strings]
+                if group_filtered_strings:
+                    # Create a new group with only filtered strings
+                    filtered_group = StringGroup(group.group_id, group.section)
+                    for s in group_filtered_strings:
+                        filtered_group.add_string(s)
+                    display_groups.append(filtered_group)
+
+            self._populate_grouped_tree(display_groups)
+        else:
+            self._populate_flat_tree(filtered_strings)
+
+    def _populate_grouped_tree(self, groups):
+        """Populate tree with grouped strings"""
+        # Sort groups by start offset
+        groups.sort(key=lambda g: g.start_offset or 0)
+
+        for group in groups:
+            # Create group header
+            group_item = self.tree.insert("", tk.END,
+                text=f"📁 {group.get_summary()}",
+                values=(
+                    f"0x{group.start_offset:x}-0x{group.end_offset:x}" if group.start_offset else "",
+                    group.section,
+                    "mixed" if len(set(s.encoding for s in group.strings)) > 1 else group.strings[0].encoding,
+                    group.dominant_category,
+                    f"{group.size} bytes",
+                    "",
+                    "",
+                    "",
+                    f"{group.avg_meaningfulness:.1f}",
+                    str(group.group_id)
+                ),
+                tags=("group_header",)
+            )
+
+            # Sort strings within group
+            sort_key = self.sort_var.get().lower()
+            if sort_key == "offset":
+                group.strings.sort(key=lambda x: x.offset)
+            elif sort_key == "length":
+                group.strings.sort(key=lambda x: x.length, reverse=True)
+            elif sort_key == "shannon entropy":
+                group.strings.sort(key=lambda x: x.entropy_shannon, reverse=True)
+            elif sort_key == "compression entropy":
+                group.strings.sort(key=lambda x: x.entropy_compression, reverse=True)
+            elif sort_key == "n-gram entropy":
+                group.strings.sort(key=lambda x: x.entropy_ngram, reverse=True)
+            elif sort_key == "meaningfulness":
+                group.strings.sort(key=lambda x: x.meaningfulness_score, reverse=True)
+
+            # Add strings to group
+            for string_info in group.strings:
+                display_string = repr(string_info.decoded_string)[1:-1]
+                if len(display_string) > 60:
+                    display_string = display_string[:57] + "..."
+
+                self.tree.insert(group_item, tk.END,
+                    text=f"  {display_string}",
+                    values=(
+                        f"0x{string_info.offset:x}",
+                        string_info.section,
+                        string_info.encoding,
+                        string_info.category,
+                        string_info.length,
+                        f"{string_info.entropy_shannon:.2f}",
+                        f"{string_info.entropy_compression:.2f}",
+                        f"{string_info.entropy_ngram:.2f}",
+                        f"{string_info.meaningfulness_score:.1f}",
+                        str(string_info.group_id) if string_info.group_id is not None else ""
+                    ),
+                    tags=(string_info,)
+                )
+
+        # Configure group header styling
+        self.tree.tag_configure("group_header", background="#e8f4fd", font=("TkDefaultFont", 9, "bold"))
+
+        # Update status
+        total_strings = sum(len(g.strings) for g in groups)
+        self.status_var.set(f"Showing {len(groups)} groups with {total_strings} strings")
+
+    def _populate_flat_tree(self, filtered_strings):
+        """Populate tree with flat string list"""
         # Sort strings
         sort_key = self.sort_var.get().lower()
         if sort_key == "offset":
@@ -651,6 +967,8 @@ class StringExtractorGUI:
             filtered_strings.sort(key=lambda x: x.entropy_ngram, reverse=True)
         elif sort_key == "meaningfulness":
             filtered_strings.sort(key=lambda x: x.meaningfulness_score, reverse=True)
+        elif sort_key == "group":
+            filtered_strings.sort(key=lambda x: x.group_id if x.group_id is not None else -1)
 
         # Populate tree
         for string_info in filtered_strings:
@@ -670,10 +988,14 @@ class StringExtractorGUI:
                     f"{string_info.entropy_shannon:.2f}",
                     f"{string_info.entropy_compression:.2f}",
                     f"{string_info.entropy_ngram:.2f}",
-                    f"{string_info.meaningfulness_score:.1f}"
+                    f"{string_info.meaningfulness_score:.1f}",
+                    str(string_info.group_id) if string_info.group_id is not None else ""
                 ),
                 tags=(string_info,)
             )
+
+        # Update status
+        self.status_var.set(f"Showing {len(filtered_strings)} strings")
 
     def show_string_details(self, event):
         """Show detailed information about selected string"""
@@ -683,7 +1005,7 @@ class StringExtractorGUI:
 
         item = selection[0]
         tags = self.tree.item(item, "tags")
-        if not tags:
+        if not tags or tags[0] == "group_header":
             return
 
         string_info = tags[0]
@@ -691,7 +1013,7 @@ class StringExtractorGUI:
         # Create detail window
         detail_window = tk.Toplevel(self.root)
         detail_window.title("String Details")
-        detail_window.geometry("600x400")
+        detail_window.geometry("600x500")
 
         # Create notebook for tabs
         notebook = ttk.Notebook(detail_window)
@@ -709,6 +1031,7 @@ Section: {string_info.section}
 Encoding: {string_info.encoding}
 Category: {string_info.category}
 Length: {string_info.length}
+Group ID: {string_info.group_id if string_info.group_id is not None else "None"}
 Shannon Entropy: {string_info.entropy_shannon:.4f}
 Compression Entropy: {string_info.entropy_compression:.4f}
 N-gram Entropy: {string_info.entropy_ngram:.4f}
@@ -737,6 +1060,45 @@ Raw String:
 
         hex_text.insert(tk.END, hex_dump)
         hex_text.config(state=tk.DISABLED)
+
+        # Group info tab (if string belongs to a group)
+        if string_info.group_id is not None and hasattr(self, 'current_groups'):
+            group_frame = ttk.Frame(notebook)
+            notebook.add(group_frame, text="Group Info")
+
+            group_text = tk.Text(group_frame, wrap=tk.WORD)
+            group_text.pack(fill=tk.BOTH, expand=True)
+
+            # Find the group
+            group = None
+            for g in self.current_groups:
+                if g.group_id == string_info.group_id:
+                    group = g
+                    break
+
+            if group:
+                group_info = f"""Group ID: {group.group_id}
+Section: {group.section}
+Strings Count: {len(group.strings)}
+Address Range: 0x{group.start_offset:x} - 0x{group.end_offset:x}
+Size: {group.size} bytes
+Dominant Category: {group.dominant_category}
+Average Meaningfulness: {group.avg_meaningfulness:.2f}
+
+Other strings in this group:
+"""
+                for other_string in group.strings:
+                    if other_string != string_info:
+                        preview = repr(other_string.decoded_string)[1:-1]
+                        if len(preview) > 60:
+                            preview = preview[:57] + "..."
+                        group_info += f"• 0x{other_string.offset:x}: {preview}\n"
+
+                group_text.insert(tk.END, group_info)
+            else:
+                group_text.insert(tk.END, "Group information not available.")
+
+            group_text.config(state=tk.DISABLED)
 
     def run(self):
         """Start the GUI"""
