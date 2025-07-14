@@ -34,9 +34,11 @@ import time
 
 # Binary parsing
 try:
-    from elftools.elf.elffile import ELFFile
+    import lief
+    print("[Parser] lief library found. Advanced binary parsing enabled.")
 except ImportError:
-    print("Please install pyelftools: pip install pyelftools")
+    print("lief library not found. This is a required dependency.")
+    print("Please install it with: pip install lief")
     raise
 
 # Machine Learning
@@ -118,37 +120,110 @@ class StringExtractor:
         self.min_length = min_length
         self.encodings = encodings or ['utf-8', 'latin-1', 'utf-16']
 
-    def extract_from_elf(self, filepath: str) -> List[StringInfo]:
-        """Extract strings from ELF file"""
+    def extract_from_file(self, filepath: str) -> List[StringInfo]:
+        """
+        Extract strings from a binary file using lief.
+        It intelligently handles various formats like ELF, PE, Mach-O, and Android binaries.
+        If a format is not recognized, it falls back to a raw scan of the file.
+        """
         print(f"[StringExtractor] Starting extraction from: {filepath}")
-        strings = []
+        all_strings = []
 
         try:
-            with open(filepath, 'rb') as f:
-                elffile = ELFFile(f)
-                print(f"[StringExtractor] ELF file loaded, architecture: {elffile.get_machine_arch()}")
+            # lief.parse can handle lists of binaries (e.g., fat Mach-O)
+            binaries = lief.parse(filepath)
+            if not binaries:
+                print(f"[StringExtractor] lief could not parse file, falling back to raw scan.")
+                return self._perform_raw_scan(filepath)
 
-                # Extract from various sections
-                section_count = 0
-                for section in elffile.iter_sections():
-                    section_name = section.name
-                    data = section.data()
-                    section_count += 1
+            # Ensure we have a list to iterate over
+            if not isinstance(binaries, list):
+                binaries = [binaries]
 
-                    print(f"[StringExtractor] Processing section {section_count}: {section_name} ({len(data)} bytes)")
+            for binary in binaries:
+                binary_name = os.path.basename(filepath)
+                print(f"[StringExtractor] Processing binary: {binary_name} (type: {type(binary).__name__})")
 
-                    # Extract ASCII/UTF-8 strings
-                    section_strings = self._extract_strings_from_data(
-                        data, section_name, section.header.sh_offset
-                    )
-                    strings.extend(section_strings)
-                    print(f"[StringExtractor] Found {len(section_strings)} strings in {section_name}")
+                # Handle ELF files
+                if isinstance(binary, lief.ELF.Binary):
+                    for section in binary.sections:
+                        if section.content and section.type != lief.ELF.Section.TYPE.NOBITS:
+                            print(f"[StringExtractor]  - Scanning ELF section: {section.name} (size: {section.size})")
+                            data = bytes(section.content)
+                            all_strings.extend(self._extract_strings_from_data(data, str(section.name), section.offset))
 
+                # Handle PE files
+                elif isinstance(binary, lief.PE.Binary):
+                    for section in binary.sections:
+                        if section.content and section.sizeof_raw_data > 0:
+                            print(f"[StringExtractor]  - Scanning PE section: {section.name} (size: {section.size})")
+                            data = bytes(section.content)
+                            all_strings.extend(self._extract_strings_from_data(data, str(section.name), section.pointerto_raw_data))
+
+                # Handle Mach-O files
+                elif isinstance(binary, lief.MachO.Binary):
+                    for section in binary.sections:
+                        if section.size > 0 and not (section.type == lief.MachO.Section.TYPE.ZEROFILL):
+                            print(f"[StringExtractor]  - Scanning Mach-O section: {section.name} (size: {section.size})")
+                            data = bytes(section.content)
+                            all_strings.extend(self._extract_strings_from_data(data, str(section.name), section.offset))
+
+                # Handle DEX files (Android)
+                elif isinstance(binary, lief.DEX.File):
+                    print(f"[StringExtractor]  - Extracting from DEX string table")
+                    for i, s in enumerate(binary.strings):
+                        try:
+                            raw_bytes = s.encode('utf-8', errors='ignore')
+                            if len(raw_bytes) >= self.min_length:
+                                all_strings.append(StringInfo(
+                                    raw_bytes=raw_bytes,
+                                    decoded_text=s,
+                                    offset=i,  # Use index as a pseudo-offset
+                                    section="dex.strings"
+                                ))
+                        except Exception:
+                            continue # Ignore decoding errors for individual strings
+
+                # Handle OAT files (Android)
+                elif isinstance(binary, lief.OAT.Binary):
+                    print(f"[StringExtractor]  - Extracting from OAT container")
+                    for dex_file in binary.dex_files:
+                        for i, s in enumerate(dex_file.strings):
+                            try:
+                                raw_bytes = s.encode('utf-8', errors='ignore')
+                                if len(raw_bytes) >= self.min_length:
+                                    all_strings.append(StringInfo(
+                                        raw_bytes=raw_bytes,
+                                        decoded_text=s,
+                                        offset=i,
+                                        section="oat.dex.strings"
+                                    ))
+                            except Exception:
+                                continue
+                else:
+                    print(f"[StringExtractor] Unhandled lief format: {type(binary).__name__}, falling back to raw scan for this part.")
+                    # This part is tricky as we don't have raw bytes easily.
+                    # The main fallback will handle the whole file if parsing fails initially.
+                    return self._perform_raw_scan(filepath)
         except Exception as e:
-            print(f"[StringExtractor] Error extracting from ELF: {e}")
+            print(f"[StringExtractor] An unexpected error occurred during parsing: {e}")
+            return self._perform_raw_scan(filepath)
 
-        print(f"[StringExtractor] Total strings extracted: {len(strings)}")
-        return strings
+        print(f"[StringExtractor] Total strings extracted: {len(all_strings)}")
+        return all_strings
+
+    def _perform_raw_scan(self, filepath: str) -> List[StringInfo]:
+        """Performs a raw string extraction on the entire file."""
+        print(f"[StringExtractor] Performing raw string extraction on {filepath}")
+        try:
+            with open(filepath, 'rb') as f:
+                data = f.read()
+            strings = self._extract_strings_from_data(data, "file_raw", 0)
+            print(f"[StringExtractor] Total strings extracted from raw scan: {len(strings)}")
+            return strings
+        except Exception as e:
+            print(f"[StringExtractor] Error reading file for raw extraction: {e}")
+            return []
 
     def _extract_strings_from_data(self, data: bytes, section: str,
                                    base_offset: int) -> List[StringInfo]:
@@ -294,9 +369,12 @@ class FeatureExtractor:
         features['has_consonant_cluster'] = int(self._has_consonant_cluster(text))
 
         # Section-based features
-        features['from_text_section'] = int('.text' in string_info.section)
-        features['from_data_section'] = int('.data' in string_info.section)
-        features['from_rodata_section'] = int('.rodata' in string_info.section)
+        section_lower = string_info.section.lower()
+        features['from_text_section'] = int('.text' in section_lower or '__text' in section_lower)
+        features['from_data_section'] = int('.data' in section_lower or '__data' in section_lower)
+        features['from_rodata_section'] = int('.rodata' in section_lower or 'const' in section_lower or '__cstring' in section_lower)
+        features['from_rsrc_section'] = int('.rsrc' in section_lower)  # PE resources
+        features['from_dex_strings'] = int('dex.strings' in section_lower or 'oat.dex.strings' in section_lower)  # Android DEX
 
         # Tokenization features
         if NLTK_AVAILABLE:
@@ -1136,8 +1214,15 @@ Space - Next Unlabeled"""
         """Open a binary file for analysis"""
         filename = filedialog.askopenfilename(
             title="Select Binary File",
-            filetypes=[("ELF files", "*.elf *.so *.o"),
-                      ("All files", "*.*")]
+            filetypes=[
+                ("All Supported Files", "*.exe *.dll *.sys *.so *.o *.elf *.macho *.dylib *.a *.lib *.dex *.odex *.art *.vdex"),
+                ("Windows Executables", "*.exe *.dll *.sys"),
+                ("ELF Files", "*.elf *.so *.o"),
+                ("Mach-O Files", "*.macho *.dylib"),
+                ("Static Libraries", "*.a *.lib"),
+                ("Android Files", "*.dex *.odex *.art *.vdex"),
+                ("All files", "*.*")
+            ]
         )
 
         if filename:
@@ -1160,7 +1245,7 @@ Space - Next Unlabeled"""
 
             # Extract strings
             print(f"[GUI] Calling string extractor...")
-            strings = self.string_extractor.extract_from_elf(filename)
+            strings = self.string_extractor.extract_from_file(filename)
             print(f"[GUI] String extraction completed, got {len(strings)} strings")
             self.task_queue.put(('update_progress', 50))
 
