@@ -66,6 +66,34 @@ except ImportError:
     CUPY_AVAILABLE = False
     print("[ML] CuPy not available - install with: pip install cupy-cuda12x")
 
+# Tokenization
+try:
+    import nltk
+    from nltk.tokenize import word_tokenize
+    from nltk.corpus import stopwords
+    NLTK_AVAILABLE = True
+    print("[NLP] NLTK available - tokenization possible")
+
+    print("[NLP] Downloading NLTK data...")
+    nltk.download('punkt', quiet=True)
+    nltk.download('punkt_tab', quiet=True)
+    nltk.download('stopwords', quiet=True)
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('corpora/stopwords')
+
+except ImportError:
+    NLTK_AVAILABLE = False
+    print("[NLP] NLTK not available - install with: pip install nltk")
+
+# Google Gemini API (optional)
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+    print("[LLM] Google Gemini API available")
+except ImportError:
+    GEMINI_AVAILABLE = False
+    print("[LLM] Google Gemini API not available - install with: pip install google-generativeai")
+
 
 class StringInfo:
     """Container for extracted string information"""
@@ -545,6 +573,187 @@ class MLModelManager:
             print(f"[MLModelManager] Warning: Model was trained with XGBoost but XGBoost not available")
 
 
+class GeminiLabelingService:
+    """Service for automated labeling using Google Gemini LLM"""
+
+    def __init__(self):
+        self.api_key = None
+        self.model = None
+        self.is_configured = False
+        self.config_file = os.path.expanduser("~/.eminence_config.json")
+        self._load_config()
+
+    def configure(self, api_key: str) -> bool:
+        """Configure the Gemini API"""
+        if not GEMINI_AVAILABLE:
+            return False
+
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-2.0-flash-lite')
+            self.api_key = api_key
+            self.is_configured = True
+            self._save_config()
+            print("[GeminiService] Successfully configured Gemini API")
+            return True
+        except Exception as e:
+            print(f"[GeminiService] Configuration failed: {e}")
+            return False
+
+    def _load_config(self):
+        """Load API key from config file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+                    api_key = config.get('gemini_api_key')
+                    if api_key:
+                        self.configure(api_key)
+                        print("[GeminiService] Loaded API key from config file")
+        except Exception as e:
+            print(f"[GeminiService] Error loading config: {e}")
+
+    def _save_config(self):
+        """Save API key to config file"""
+        try:
+            config = {}
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    config = json.load(f)
+
+            config['gemini_api_key'] = self.api_key
+
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            print(f"[GeminiService] Saved API key to {self.config_file}")
+        except Exception as e:
+            print(f"[GeminiService] Error saving config: {e}")
+
+    def label_strings(self, strings: List[StringInfo]) -> List[Tuple[StringInfo, bool, str]]:
+        """Label multiple strings using Gemini. Returns list of (string_info, is_meaningful, reasoning)"""
+        if not self.is_configured:
+            return []
+
+        import concurrent.futures
+        import json
+
+        # Split into batches of 50
+        batch_size = 50
+        batches = [strings[i:i+batch_size] for i in range(0, len(strings), batch_size)]
+
+        print(f"[GeminiService] Processing {len(strings)} strings in {len(batches)} parallel batches of {batch_size}")
+
+        all_results = []
+
+        def process_batch(batch_data):
+            batch_idx, batch_strings = batch_data
+
+            # Prepare batch prompt with JSON format
+            prompt = """You are an expert reverse engineer analyzing strings extracted from binary files.
+For each string below, determine if it is "meaningful" or "meaningless" for reverse engineering purposes.
+
+Meaningful strings include:
+- Function names, variable names, class names
+- Error messages, debug messages, log messages
+- File paths, URLs, configuration keys
+- Human-readable text, documentation
+- API endpoints, protocol strings
+- Version information, build information
+
+Meaningless strings include:
+- Random data, encrypted/encoded data
+- Binary artifacts, padding, alignment data
+- Compiler-generated symbols without semantic meaning
+- Memory addresses, raw pointers
+- Gibberish, corrupted data
+
+Respond with a JSON array where each object has:
+- "index": the string index number
+- "meaningful": true or false
+- "reasoning": brief explanation
+
+Example response:
+[
+  {"index": 0, "meaningful": true, "reasoning": "Function name pattern"},
+  {"index": 1, "meaningful": false, "reasoning": "Random binary data"}
+]
+
+Here are the strings to analyze:
+
+"""
+
+            # Add strings to prompt
+            for i, string_info in enumerate(batch_strings):
+                # Truncate very long strings
+                text = string_info.decoded_text
+                if len(text) > 200:
+                    text = text[:197] + "..."
+                prompt += f"{i}: {repr(text)}\n"
+
+            prompt += "\nRespond with only the JSON array, no other text:"
+
+            try:
+                print(f"[GeminiService] Batch {batch_idx + 1}/{len(batches)}: Sending {len(batch_strings)} strings...")
+                response = self.model.generate_content(prompt)
+
+                # Parse JSON response
+                response_text = response.text.strip()
+
+                # Try to extract JSON from response (in case there's extra text)
+                start_idx = response_text.find('[')
+                end_idx = response_text.rfind(']') + 1
+
+                batch_results = []
+                if start_idx != -1 and end_idx != 0:
+                    json_text = response_text[start_idx:end_idx]
+
+                    try:
+                        parsed_results = json.loads(json_text)
+
+                        for result in parsed_results:
+                            if isinstance(result, dict) and all(key in result for key in ['index', 'meaningful', 'reasoning']):
+                                index = int(result['index'])
+
+                                if 0 <= index < len(batch_strings):
+                                    is_meaningful = bool(result['meaningful'])
+                                    reasoning = str(result['reasoning'])
+                                    batch_results.append((batch_strings[index], is_meaningful, reasoning))
+
+                    except json.JSONDecodeError as e:
+                        print(f"[GeminiService] Batch {batch_idx + 1} JSON parsing failed: {e}")
+                        print(f"[GeminiService] Response text: {response_text[:500]}...")
+                else:
+                    print(f"[GeminiService] Batch {batch_idx + 1} No JSON array found in response")
+                    print(f"[GeminiService] Response text: {response_text[:500]}...")
+
+                print(f"[GeminiService] Batch {batch_idx + 1} processed {len(batch_results)} out of {len(batch_strings)} strings")
+                return batch_results
+
+            except Exception as e:
+                print(f"[GeminiService] Batch {batch_idx + 1} API call failed: {e}")
+                return []
+
+        # Process batches in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Submit all batches
+            future_to_batch = {
+                executor.submit(process_batch, (i, batch)): i
+                for i, batch in enumerate(batches)
+            }
+
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_batch):
+                batch_idx = future_to_batch[future]
+                try:
+                    batch_results = future.result()
+                    all_results.extend(batch_results)
+                except Exception as e:
+                    print(f"[GeminiService] Batch {batch_idx + 1} failed with exception: {e}")
+
+        print(f"[GeminiService] Total processed {len(all_results)} out of {len(strings)} strings across all batches")
+        return all_results
+
+
 class StringAnalyzerGUI:
     """Main GUI application for string analysis"""
 
@@ -557,6 +766,7 @@ class StringAnalyzerGUI:
         self.string_extractor = StringExtractor()
         self.feature_extractor = FeatureExtractor()
         self.model_manager = MLModelManager(use_gpu=True)  # Enable GPU by default
+        self.gemini_service = GeminiLabelingService()
 
         # Data storage
         self.current_file = None
@@ -605,21 +815,31 @@ class StringAnalyzerGUI:
         model_menu.add_command(label="Save Model...", command=self._save_model)
         model_menu.add_command(label="Load Model...", command=self._load_model)
         model_menu.add_separator()
-        
+
         # GPU settings submenu
         gpu_menu = tk.Menu(model_menu, tearoff=0)
         model_menu.add_cascade(label="GPU Settings", menu=gpu_menu)
-        
+
         self.gpu_enabled_var = tk.BooleanVar(value=XGB_AVAILABLE)
-        gpu_menu.add_checkbutton(label="Enable GPU Acceleration", 
+        gpu_menu.add_checkbutton(label="Enable GPU Acceleration",
                                 variable=self.gpu_enabled_var,
                                 command=self._toggle_gpu)
-        
+
         gpu_status = "Available" if XGB_AVAILABLE else "Not Available"
         gpu_menu.add_command(label=f"GPU Status: {gpu_status}", state='disabled')
-        
+
         model_menu.add_separator()
         model_menu.add_command(label="Clear All Labels", command=self._clear_labels)
+
+        # LLM menu
+        llm_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="LLM", menu=llm_menu)
+        llm_menu.add_command(label="Configure Gemini API...", command=self._configure_gemini)
+        llm_menu.add_command(label="Label Selected with Gemini", command=self._label_with_gemini)
+        llm_menu.add_separator()
+
+        gemini_status = "Available" if GEMINI_AVAILABLE else "Not Available"
+        llm_menu.add_command(label=f"Gemini Status: {gemini_status}", state='disabled')
 
         # Main container
         main_frame = ttk.Frame(self.root, padding="10")
@@ -794,7 +1014,7 @@ class StringAnalyzerGUI:
                                                           columnspan=2, pady=(0, 5))
 
         shortcuts_text = """M - Mark as Meaningful
-N - Mark as Not Meaningful  
+N - Mark as Not Meaningful
 C - Clear Label
 Space - Next Unlabeled"""
 
@@ -806,12 +1026,12 @@ Space - Next Unlabeled"""
         status_frame = ttk.Frame(self.root)
         status_frame.grid(row=1, column=0, sticky=(tk.W, tk.E))
         status_frame.columnconfigure(0, weight=1)
-        
+
         self.status_var = tk.StringVar(value="Ready")
         status_bar = ttk.Label(status_frame, textvariable=self.status_var,
                               relief=tk.SUNKEN, anchor=tk.W)
         status_bar.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
+
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(status_frame, variable=self.progress_var,
                                            maximum=100, length=200)
@@ -821,17 +1041,17 @@ Space - Next Unlabeled"""
     def _toggle_gpu(self):
         """Toggle GPU acceleration setting"""
         gpu_enabled = self.gpu_enabled_var.get()
-        
+
         if gpu_enabled and not XGB_AVAILABLE:
-            messagebox.showwarning("GPU Not Available", 
+            messagebox.showwarning("GPU Not Available",
                                  "XGBoost is required for GPU acceleration.\n"
                                  "Install with: pip install xgboost")
             self.gpu_enabled_var.set(False)
             return
-        
+
         # Create new model manager with updated GPU setting
         self.model_manager = MLModelManager(use_gpu=gpu_enabled)
-        
+
         status = "enabled" if gpu_enabled else "disabled"
         print(f"[GUI] GPU acceleration {status}")
         self.status_var.set(f"GPU acceleration {status}")
@@ -857,11 +1077,11 @@ Space - Next Unlabeled"""
         """Extract strings in background thread"""
         try:
             print(f"[GUI] Starting string extraction thread for: {filename}")
-            
+
             # Show progress bar
             self.task_queue.put(('show_progress', True))
             self.task_queue.put(('update_progress', 10))
-            
+
             # Extract strings
             print(f"[GUI] Calling string extractor...")
             strings = self.string_extractor.extract_from_elf(filename)
@@ -881,7 +1101,7 @@ Space - Next Unlabeled"""
 
             print(f"[GUI] Feature extraction completed")
             self.task_queue.put(('update_progress', 100))
-            
+
             # Queue GUI update
             self.task_queue.put(('strings_extracted', strings))
             self.task_queue.put(('show_progress', False))
@@ -914,10 +1134,10 @@ Space - Next Unlabeled"""
                         self.progress_var.set(0)
                     else:
                         self.progress_bar.grid_remove()
-                        
+
                 elif task == 'update_progress':
                     self.progress_var.set(data)
-                    
+
                 elif task == 'model_trained':
                     success, message = data
                     if success:
@@ -972,7 +1192,7 @@ Space - Next Unlabeled"""
 
             # Insert into tree
             entropy_text = f"{string_info.features.get('entropy', 0):.3f}" if string_info.features else "0.000"
-            
+
             self.tree.insert('', 'end', values=(
                 display_text,
                 len(string_info.decoded_text),
@@ -989,7 +1209,7 @@ Space - Next Unlabeled"""
         labeled = sum(1 for s in self.strings if s.user_label is not None)
         meaningful = sum(1 for s in self.strings if s.user_label is True)
         not_meaningful = sum(1 for s in self.strings if s.user_label is False)
-        
+
         if self.training_mode_var.get():
             stats_text = (f"Training Mode: {len(self.filtered_strings)} selected | "
                          f"Total: {total} | Labeled: {labeled}")
@@ -1040,30 +1260,30 @@ Space - Next Unlabeled"""
         """Get 100 unlabeled strings focusing on potential misclassifications"""
         import random
         import numpy as np
-        
+
         # Step 1: Filter all unlabeled entries
         unlabeled_strings = [s for s in self.strings if s.user_label is None]
-        
+
         if len(unlabeled_strings) < 100:
             print(f"[GUI] Training mode: Only {len(unlabeled_strings)} unlabeled strings available")
             return unlabeled_strings
-        
+
         # Ensure features are extracted for all unlabeled strings
         for string_info in unlabeled_strings:
             if not string_info.features:
                 self.feature_extractor.extract_features(string_info)
-        
+
         unlabeled_scores = [s.ml_score for s in unlabeled_strings]
         mean_score = np.mean(unlabeled_scores)
         std_score = np.std(unlabeled_scores)
-        
+
         print(f"[GUI] Training mode: {len(unlabeled_strings)} unlabeled strings")
         print(f"[GUI] Training mode: ML score stats - mean: {mean_score:.3f}, std: {std_score:.3f}")
         print(f"[GUI] Training mode: Score range: {min(unlabeled_scores):.3f} to {max(unlabeled_scores):.3f}")
-        
+
         # Step 2: Prioritize strings likely to be misclassified
         training_strings = []
-        
+
         # Category 1: Decision boundary (40 strings) - most uncertain predictions
         boundary_strings = [s for s in unlabeled_strings if 0.3 <= s.ml_score <= 0.7]
         if boundary_strings:
@@ -1071,7 +1291,7 @@ Space - Next Unlabeled"""
             sampled_boundary = random.sample(boundary_strings, sample_size)
             training_strings.extend(sampled_boundary)
             print(f"[GUI] Training mode: Decision boundary (0.3-0.7): {len(boundary_strings)} available, sampled {sample_size}")
-        
+
         # Category 2: High-confidence low scores (20 strings) - potential false negatives
         # These might be meaningful strings the model thinks are meaningless
         low_conf_strings = [s for s in unlabeled_strings if s.ml_score <= 0.2]
@@ -1090,14 +1310,14 @@ Space - Next Unlabeled"""
                     score += s.features.get('word_count', 0) * 0.1
                     score += (1 - s.features.get('entropy', 0) / 8) * 2  # Lower entropy = more meaningful
                 meaningful_features.append((s, score))
-            
+
             # Sort by meaningfulness features and take top candidates
             meaningful_features.sort(key=lambda x: x[1], reverse=True)
             sample_size = min(20, len(meaningful_features))
             sampled_low = [item[0] for item in meaningful_features[:sample_size]]
             training_strings.extend(sampled_low)
             print(f"[GUI] Training mode: Low confidence (≤0.2): {len(low_conf_strings)} available, sampled {sample_size}")
-        
+
         # Category 3: High-confidence high scores (20 strings) - potential false positives
         # These might be meaningless strings the model thinks are meaningful
         high_conf_strings = [s for s in unlabeled_strings if s.ml_score >= 0.8]
@@ -1116,30 +1336,30 @@ Space - Next Unlabeled"""
                     if s.features.get('word_count', 0) == 0:  # No recognizable words
                         score += 2
                 random_features.append((s, score))
-            
+
             # Sort by randomness features and take top candidates
             random_features.sort(key=lambda x: x[1], reverse=True)
             sample_size = min(20, len(random_features))
             sampled_high = [item[0] for item in random_features[:sample_size]]
             training_strings.extend(sampled_high)
             print(f"[GUI] Training mode: High confidence (≥0.8): {len(high_conf_strings)} available, sampled {sample_size}")
-        
+
         # Category 4: Fill remaining slots with diverse samples (up to 20 strings)
         remaining_slots = 100 - len(training_strings)
         if remaining_slots > 0:
             # Get strings not already selected
             selected_offsets = {s.offset for s in training_strings}
             remaining_strings = [s for s in unlabeled_strings if s.offset not in selected_offsets]
-            
+
             if remaining_strings:
                 # Sample from different score ranges to ensure diversity
                 ranges = [
                     (0.0, 0.1, "very low"),
                     (0.1, 0.3, "low"),
-                    (0.7, 0.9, "high"), 
+                    (0.7, 0.9, "high"),
                     (0.9, 1.0, "very high")
                 ]
-                
+
                 per_range = remaining_slots // len(ranges)
                 for min_s, max_s, label in ranges:
                     range_strings = [s for s in remaining_strings if min_s <= s.ml_score <= max_s]
@@ -1148,22 +1368,22 @@ Space - Next Unlabeled"""
                         sampled = random.sample(range_strings, sample_size)
                         training_strings.extend(sampled)
                         print(f"[GUI] Training mode: Diversity {label} ({min_s}-{max_s}): sampled {sample_size}")
-        
+
         print(f"[GUI] Training mode: Selected {len(training_strings)} strings total")
-        
+
         # Show final distribution
         if training_strings:
             selected_scores = [s.ml_score for s in training_strings]
             boundary_count = sum(1 for s in selected_scores if 0.3 <= s <= 0.7)
             low_count = sum(1 for s in selected_scores if s <= 0.2)
             high_count = sum(1 for s in selected_scores if s >= 0.8)
-            
+
             print(f"[GUI] Training mode: Final distribution:")
             print(f"  Decision boundary (0.3-0.7): {boundary_count} strings")
-            print(f"  Low confidence (≤0.2): {low_count} strings") 
+            print(f"  Low confidence (≤0.2): {low_count} strings")
             print(f"  High confidence (≥0.8): {high_count} strings")
             print(f"  Other ranges: {len(training_strings) - boundary_count - low_count - high_count} strings")
-        
+
         return training_strings
 
     def _on_string_select(self, event):
@@ -1184,7 +1404,7 @@ Space - Next Unlabeled"""
         index = self.tree.index(selection[0])
         if 0 <= index < len(self.filtered_strings):
             string_info = self.filtered_strings[index]
-            
+
             # If multiple items selected, show count in details
             if len(selection) > 1:
                 self._show_multi_selection_details(len(selection))
@@ -1227,13 +1447,13 @@ Features:
 
 Selected Items: {count}
 
-Use the labeling buttons below to apply 
+Use the labeling buttons below to apply
 the same label to all selected strings.
 
-This is useful for batch labeling of 
+This is useful for batch labeling of
 similar strings.
 """
-        
+
         self.details_text.insert(1.0, details)
 
     def _label_string(self, label: Optional[bool]):
@@ -1244,7 +1464,7 @@ similar strings.
 
         # Get all selected string indices
         selected_indices = [self.tree.index(item) for item in selection]
-        selected_strings = [self.filtered_strings[i] for i in selected_indices 
+        selected_strings = [self.filtered_strings[i] for i in selected_indices
                            if 0 <= i < len(self.filtered_strings)]
 
         if not selected_strings:
@@ -1282,7 +1502,7 @@ similar strings.
         # Update display
         self._update_string_list()
         self._update_stats()
-        
+
         # Show details for first selected item or multi-selection info
         if len(selected_strings) == 1:
             self._show_string_details(selected_strings[0])
@@ -1359,7 +1579,7 @@ similar strings.
         """Train or retrain the ML model"""
         self.status_var.set("Training model...")
         self.task_queue.put(('show_progress', True))
-        
+
         # Run training in background thread
         threading.Thread(target=self._train_model_thread, daemon=True).start()
 
@@ -1386,7 +1606,7 @@ similar strings.
 
         self.status_var.set("Applying model...")
         self.task_queue.put(('show_progress', True))
-        
+
         # Run prediction in background thread
         threading.Thread(target=self._apply_model_thread, daemon=True).start()
 
@@ -1395,11 +1615,11 @@ similar strings.
         try:
             print(f"[GUI] Starting model application thread for {len(self.strings)} strings...")
             self.task_queue.put(('update_progress', 10))
-            
+
             # Apply model with progress updates
             total_strings = len(self.strings)
             batch_size = max(1, total_strings // 10)  # Update progress 10 times
-            
+
             for i in range(0, total_strings, batch_size):
                 batch = self.strings[i:i+batch_size]
                 self.model_manager.predict_scores(batch)
@@ -1407,12 +1627,12 @@ similar strings.
                 self.task_queue.put(('update_progress', progress))
                 if i % (batch_size * 3) == 0:  # Log every 3 batches
                     print(f"[GUI] Model application progress: {i}/{total_strings}")
-            
+
             print(f"[GUI] Model application thread completed")
             self.task_queue.put(('update_progress', 100))
             self.task_queue.put(('show_progress', False))
             self.task_queue.put(('model_applied', None))
-            
+
         except Exception as e:
             print(f"[GUI] Error in model application thread: {str(e)}")
             self.task_queue.put(('show_progress', False))
@@ -1554,11 +1774,11 @@ similar strings.
                 self.model_manager.load_model(filepath)
                 self.status_var.set("Model loaded from command line")
                 print(f"[GUI] Model loaded successfully from: {filepath}")
-                
+
                 # Apply to current strings if any
                 if self.strings:
                     self._apply_model_to_all()
-                    
+
             except Exception as e:
                 print(f"[GUI] Error loading model: {str(e)}")
                 messagebox.showerror("Model Load Error", f"Failed to load model: {str(e)}")
@@ -1589,13 +1809,130 @@ similar strings.
                 self._update_stats()
                 self.status_var.set(f"Labels loaded from command line: {applied} applied")
                 print(f"[GUI] Labels loaded successfully: {applied} applied from {filepath}")
-                
+
             except Exception as e:
                 print(f"[GUI] Error loading labels: {str(e)}")
                 messagebox.showerror("Labels Load Error", f"Failed to load labels: {str(e)}")
         else:
             print(f"[GUI] Error: Labels file not found: {filepath}")
             messagebox.showerror("Labels Not Found", f"Could not find labels file: {filepath}")
+
+    def _configure_gemini(self):
+        """Configure Google Gemini API"""
+        if not GEMINI_AVAILABLE:
+            messagebox.showerror("Gemini Not Available",
+                               "Google Gemini API is not available.\n"
+                               "Install with: pip install google-generativeai")
+            return
+
+        # Create API key input dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Configure Gemini API")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Center the dialog
+        dialog.geometry("+%d+%d" % (self.root.winfo_rootx() + 50, self.root.winfo_rooty() + 50))
+
+        ttk.Label(dialog, text="Enter your Google Gemini API Key:").pack(pady=10)
+
+        api_key_var = tk.StringVar()
+        entry = ttk.Entry(dialog, textvariable=api_key_var, width=50, show="*")
+        entry.pack(pady=5)
+        entry.focus()
+
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(pady=10)
+
+        def on_ok():
+            api_key = api_key_var.get().strip()
+            if api_key:
+                if self.gemini_service.configure(api_key):
+                    messagebox.showinfo("Success", "Gemini API configured successfully!")
+                    dialog.destroy()
+                else:
+                    messagebox.showerror("Error", "Failed to configure Gemini API. Check your API key.")
+            else:
+                messagebox.showwarning("Warning", "Please enter an API key.")
+
+        def on_cancel():
+            dialog.destroy()
+
+        ttk.Button(button_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+
+        # Bind Enter key
+        entry.bind('<Return>', lambda e: on_ok())
+
+    def _label_with_gemini(self):
+        """Label selected strings using Google Gemini"""
+        if not self.gemini_service.is_configured:
+            messagebox.showwarning("Gemini Not Configured",
+                                 "Please configure the Gemini API first.")
+            return
+
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select strings to label.")
+            return
+
+        # Get selected strings
+        selected_indices = [self.tree.index(item) for item in selection]
+        selected_strings = [self.filtered_strings[i] for i in selected_indices
+                           if 0 <= i < len(self.filtered_strings)]
+
+        if not selected_strings:
+            return
+
+        # Limit batch size to avoid API limits
+        if len(selected_strings) > 20:
+            if not messagebox.askyesno("Large Selection",
+                                     f"You selected {len(selected_strings)} strings. "
+                                     f"This may take a while and use API quota. Continue?"):
+                return
+
+        self.status_var.set(f"Labeling {len(selected_strings)} strings with Gemini...")
+        self.task_queue.put(('show_progress', True))
+
+        # Run labeling in background thread
+        threading.Thread(target=self._gemini_labeling_thread,
+                        args=(selected_strings,), daemon=True).start()
+
+    def _gemini_labeling_thread(self, strings: List[StringInfo]):
+        """Run Gemini labeling in background thread"""
+        try:
+            self.task_queue.put(('update_progress', 20))
+
+            # Process in batches to avoid API limits
+            batch_size = 100
+            total_labeled = 0
+
+            for i in range(0, len(strings), batch_size):
+                batch = strings[i:i+batch_size]
+
+                # Get labels from Gemini
+                results = self.gemini_service.label_strings(batch)
+
+                # Apply labels
+                for string_info, is_meaningful, reasoning in results:
+                    string_info.user_label = is_meaningful
+                    # Store reasoning in a comment-like way (could extend StringInfo for this)
+                    total_labeled += 1
+
+                progress = 20 + ((i + len(batch)) / len(strings)) * 70
+                self.task_queue.put(('update_progress', progress))
+
+                # Small delay to be respectful to API
+                time.sleep(0.5)
+
+            self.task_queue.put(('update_progress', 100))
+            self.task_queue.put(('show_progress', False))
+            self.task_queue.put(('gemini_labeling_complete', total_labeled))
+
+        except Exception as e:
+            self.task_queue.put(('show_progress', False))
+            self.task_queue.put(('error', f"Error in Gemini labeling: {str(e)}"))
 
 
 def main():
@@ -1607,34 +1944,34 @@ def main():
     parser.add_argument("--no-gpu", action="store_true", help="Disable GPU acceleration")
     parser.add_argument("--model", help="Model file to load (.pkl)")
     parser.add_argument("--labels", help="Labels file to load (.json)")
-    
+
     args = parser.parse_args()
-    
+
     print("=" * 60)
     print("String Meaningfulness Analyzer - Starting")
     print("=" * 60)
-    
+
     if args.binary:
         print(f"[Main] Binary file specified: {args.binary}")
-    
+
     if args.gpu and args.no_gpu:
         print("[Main] Warning: Both --gpu and --no-gpu specified, using default")
     elif args.gpu:
         print("[Main] GPU acceleration explicitly enabled")
     elif args.no_gpu:
         print("[Main] GPU acceleration explicitly disabled")
-    
+
     print("[Main] Initializing GUI...")
-    
+
     root = tk.Tk()
     app = StringAnalyzerGUI(root, initial_file=args.binary)
-    
+
     # Auto-load model and labels if provided
     if args.model:
         app.root.after(1000, lambda: app._load_initial_model(args.model))
     if args.labels:
         app.root.after(1500, lambda: app._load_initial_labels(args.labels))
-    
+
     print("[Main] GUI initialized, starting main loop...")
     root.mainloop()
     print("[Main] Application closed")
