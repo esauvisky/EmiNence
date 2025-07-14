@@ -388,11 +388,11 @@ class FeatureExtractor:
             features['avg_token_length'] = 0.0
 
         # Verbose output for interesting strings
-        if (pattern_matches > 0 or features['keyword_count'] > 0 or
-            features['common_word_ratio'] > 0.5 or len(text) > 50):
-            print(f"[FeatureExtractor] Interesting string: '{text[:50]}...' "
-                  f"(patterns: {pattern_matches}, keywords: {features['keyword_count']}, "
-                  f"entropy: {features['entropy']:.2f})")
+        # if (pattern_matches > 0 or features['keyword_count'] > 0 or
+        #     features['common_word_ratio'] > 0.5 or len(text) > 50):
+        #     print(f"[FeatureExtractor] Interesting string: '{text[:50]}...' "
+        #           f"(patterns: {pattern_matches}, keywords: {features['keyword_count']}, "
+        #           f"entropy: {features['entropy']:.2f})")
 
         # Store features in StringInfo
         string_info.features = features
@@ -938,6 +938,8 @@ class StringAnalyzerGUI:
         self.root.bind('<Key-n>', lambda e: self._label_string(False))
         self.root.bind('<Key-c>', lambda e: self._label_string(None))
         self.root.bind('<Key-space>', lambda e: self._select_next_unlabeled())
+        self.root.bind('<Control-a>', self._select_all_strings) # For Ctrl+A
+        self.root.bind('<Control-A>', self._select_all_strings) # For Ctrl+Shift+A
 
         # Start background task processor
         self.root.after(100, self._process_tasks)
@@ -1321,6 +1323,35 @@ Space - Next Unlabeled"""
                     messagebox.showerror("Error", data)
                     self.status_var.set("Error occurred")
 
+                elif task == 'gemini_labeling_complete':
+                    total_labeled, labeled_strings_processed = data
+                    # Gemini labeled strings are a subset of self.filtered_strings
+                    # The StringInfo objects themselves are updated by reference.
+                    # We need to trigger a refresh of the GUI and re-select the labeled items.
+                    self._update_string_list() # Re-populates the treeview with updated data
+                    self._update_stats()
+                    self.status_var.set(f"Gemini labeled {total_labeled} strings")
+
+                    # Re-select the items that were just labeled
+                    self.tree.selection_remove(self.tree.selection()) # Clear current selection
+                    item_ids_to_select = []
+                    # Map filtered_strings (which is the current display list) to treeview item IDs
+                    # Assumes _update_string_list() populates self.tree in the same order as self.filtered_strings
+                    for labeled_string_info in labeled_strings_processed:
+                        try:
+                            # Find the index of the labeled_string_info in the currently filtered list
+                            idx_in_filtered = self.filtered_strings.index(labeled_string_info)
+                            item_id = self.tree.get_children()[idx_in_filtered]
+                            item_ids_to_select.append(item_id)
+                        except ValueError:
+                            # String might have been filtered out or not found
+                            pass
+
+                    if item_ids_to_select:
+                        self.tree.selection_add(*item_ids_to_select)
+                        # Scroll to the first newly selected item
+                        self.tree.see(item_ids_to_select[0])
+
         except queue.Empty:
             pass
 
@@ -1448,7 +1479,7 @@ Space - Next Unlabeled"""
         # Category 1: Decision boundary (40 strings) - most uncertain predictions
         boundary_strings = [s for s in unlabeled_strings if 0.3 <= s.ml_score <= 0.7]
         if boundary_strings:
-            sample_size = min(40, len(boundary_strings))
+            sample_size = min(50, len(boundary_strings))
             sampled_boundary = random.sample(boundary_strings, sample_size)
             training_strings.extend(sampled_boundary)
             print(f"[GUI] Training mode: Decision boundary (0.3-0.7): {len(boundary_strings)} available, sampled {sample_size}")
@@ -1735,6 +1766,13 @@ similar strings.
                 self.tree.see(item_id)
                 self._on_string_select(None)
                 break
+
+    def _select_all_strings(self, event=None):
+        """Select all visible strings in the treeview."""
+        if self.filtered_strings:
+            all_item_ids = self.tree.get_children()
+            self.tree.selection_set(all_item_ids)
+            print(f"[GUI] Selected all {len(all_item_ids)} visible strings.")
 
     def _train_model(self):
         """Train or retrain the ML model"""
@@ -2089,9 +2127,10 @@ similar strings.
 
             self.task_queue.put(('update_progress', 100))
             self.task_queue.put(('show_progress', False))
-            self.task_queue.put(('gemini_labeling_complete', total_labeled))
+            self.task_queue.put(('gemini_labeling_complete', (total_labeled, strings)))
 
         except Exception as e:
+            print(f"[GUI] Error in Gemini labeling thread: {str(e)}")
             self.task_queue.put(('show_progress', False))
             self.task_queue.put(('error', f"Error in Gemini labeling: {str(e)}"))
 
