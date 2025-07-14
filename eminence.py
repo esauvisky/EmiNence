@@ -134,7 +134,7 @@ class StringExtractor:
                     section_name = section.name
                     data = section.data()
                     section_count += 1
-                    
+
                     print(f"[StringExtractor] Processing section {section_count}: {section_name} ({len(data)} bytes)")
 
                     # Extract ASCII/UTF-8 strings
@@ -228,6 +228,15 @@ class FeatureExtractor:
                                 'that', 'have', 'i', 'it', 'for', 'not', 'on',
                                 'with', 'he', 'as', 'you', 'do', 'at'])
 
+        # Initialize tokenization
+        if NLTK_AVAILABLE:
+            try:
+                self.stop_words = set(stopwords.words('english'))
+            except:
+                self.stop_words = set()
+        else:
+            self.stop_words = set()
+
     def extract_features(self, string_info: StringInfo) -> Dict[str, float]:
         """Extract features from a string"""
         text = string_info.decoded_text
@@ -289,8 +298,19 @@ class FeatureExtractor:
         features['from_data_section'] = int('.data' in string_info.section)
         features['from_rodata_section'] = int('.rodata' in string_info.section)
 
+        # Tokenization features
+        if NLTK_AVAILABLE:
+            token_features = self._extract_token_features(text)
+            features.update(token_features)
+        else:
+            # Basic tokenization fallback
+            features['token_count'] = len(text.split())
+            features['unique_token_ratio'] = 0.0
+            features['stop_word_ratio'] = 0.0
+            features['avg_token_length'] = 0.0
+
         # Verbose output for interesting strings
-        if (pattern_matches > 0 or features['keyword_count'] > 0 or 
+        if (pattern_matches > 0 or features['keyword_count'] > 0 or
             features['common_word_ratio'] > 0.5 or len(text) > 50):
             print(f"[FeatureExtractor] Interesting string: '{text[:50]}...' "
                   f"(patterns: {pattern_matches}, keywords: {features['keyword_count']}, "
@@ -298,6 +318,62 @@ class FeatureExtractor:
 
         # Store features in StringInfo
         string_info.features = features
+        return features
+
+    def _extract_token_features(self, text: str) -> Dict[str, float]:
+        """Extract tokenization-based features"""
+        features = {}
+
+        try:
+            # Tokenize the text
+            tokens = word_tokenize(text.lower())
+
+            # Basic token statistics
+            features['token_count'] = len(tokens)
+
+            if tokens:
+                # Unique token ratio
+                unique_tokens = set(tokens)
+                features['unique_token_ratio'] = len(unique_tokens) / len(tokens)
+
+                # Stop word ratio
+                stop_word_count = sum(1 for token in tokens if token in self.stop_words)
+                features['stop_word_ratio'] = stop_word_count / len(tokens)
+
+                # Average token length
+                features['avg_token_length'] = sum(len(token) for token in tokens) / len(tokens)
+
+                # Alphabetic token ratio
+                alpha_tokens = sum(1 for token in tokens if token.isalpha())
+                features['alpha_token_ratio'] = alpha_tokens / len(tokens)
+
+                # Numeric token ratio
+                numeric_tokens = sum(1 for token in tokens if token.isdigit())
+                features['numeric_token_ratio'] = numeric_tokens / len(tokens)
+
+                # Mixed alphanumeric token ratio
+                mixed_tokens = sum(1 for token in tokens if any(c.isalpha() for c in token) and any(c.isdigit() for c in token))
+                features['mixed_token_ratio'] = mixed_tokens / len(tokens)
+
+            else:
+                features['unique_token_ratio'] = 0.0
+                features['stop_word_ratio'] = 0.0
+                features['avg_token_length'] = 0.0
+                features['alpha_token_ratio'] = 0.0
+                features['numeric_token_ratio'] = 0.0
+                features['mixed_token_ratio'] = 0.0
+
+        except Exception as e:
+            print(f"[FeatureExtractor] Tokenization error: {e}")
+            # Fallback to basic features
+            features['token_count'] = len(text.split())
+            features['unique_token_ratio'] = 0.0
+            features['stop_word_ratio'] = 0.0
+            features['avg_token_length'] = 0.0
+            features['alpha_token_ratio'] = 0.0
+            features['numeric_token_ratio'] = 0.0
+            features['mixed_token_ratio'] = 0.0
+
         return features
 
     def _calculate_entropy(self, text: str) -> float:
@@ -347,7 +423,7 @@ class MLModelManager:
         self.training_history = []
         self.use_gpu = use_gpu and XGB_AVAILABLE
         self.gpu_available = self._check_gpu_availability()
-        
+
         if self.use_gpu and self.gpu_available:
             print(f"[MLModelManager] GPU acceleration enabled")
         else:
@@ -357,7 +433,7 @@ class MLModelManager:
         """Check if GPU is available for XGBoost"""
         if not XGB_AVAILABLE:
             return False
-        
+
         try:
             # Try to create a simple XGBoost model with GPU
             import subprocess
@@ -367,7 +443,7 @@ class MLModelManager:
                 return True
         except:
             pass
-        
+
         print(f"[MLModelManager] No compatible GPU found")
         return False
 
@@ -375,7 +451,7 @@ class MLModelManager:
                    min_samples: int = 10) -> Tuple[bool, str]:
         """Train the ML model on labeled strings"""
         print(f"[MLModelManager] Starting model training...")
-        
+
         # Filter for labeled strings
         labeled_strings = [s for s in string_infos if s.user_label is not None]
         print(f"[MLModelManager] Found {len(labeled_strings)} labeled strings out of {len(string_infos)} total")
@@ -399,7 +475,7 @@ class MLModelManager:
                 label = 1 if string_info.user_label else 0
                 y.append(label)
                 weights.append(string_info.feedback_weight)
-                
+
                 if label == 1:
                     positive_count += 1
                 else:
@@ -457,11 +533,11 @@ class MLModelManager:
         # Evaluate on training data (in practice, should use validation set)
         predictions = self.model.predict(X_scaled)
         accuracy = np.mean(predictions == y)
-        
+
         # Feature importance
         if hasattr(self.model, 'feature_importances_'):
             feature_importance = self.model.feature_importances_
-            top_features = sorted(zip(self.feature_names, feature_importance), 
+            top_features = sorted(zip(self.feature_names, feature_importance),
                                  key=lambda x: x[1], reverse=True)[:5]
             print(f"[MLModelManager] Top 5 important features:")
             for fname, importance in top_features:
@@ -477,11 +553,11 @@ class MLModelManager:
             return
 
         print(f"[MLModelManager] Predicting scores for {len(string_infos)} strings...")
-        
+
         # Collect all feature vectors and corresponding string_infos
         feature_vectors = []
         valid_strings = []
-        
+
         for string_info in string_infos:
             if string_info.features:
                 # Ensure features match training features
@@ -489,15 +565,15 @@ class MLModelManager:
                                 for fname in self.feature_names]
                 feature_vectors.append(feature_vector)
                 valid_strings.append(string_info)
-        
+
         if not feature_vectors:
             print(f"[MLModelManager] No valid feature vectors found")
             return
-            
+
         # Batch prediction - much faster than individual predictions
         X = np.array(feature_vectors)
         X_scaled = self.scaler.transform(X)
-        
+
         # Use GPU arrays if available and beneficial for large datasets
         if CUPY_AVAILABLE and len(feature_vectors) > 1000:
             print(f"[MLModelManager] Using GPU arrays for large dataset ({len(feature_vectors)} samples)")
@@ -507,18 +583,18 @@ class MLModelManager:
                 X_scaled = cp.asnumpy(X_scaled_gpu)
             except Exception as e:
                 print(f"[MLModelManager] GPU array conversion failed, using CPU: {e}")
-        
+
         # Get probabilities for all strings at once
         probabilities = self.model.predict_proba(X_scaled)
-        
+
         # Assign scores back to string_infos
         predictions_made = 0
         high_confidence_predictions = 0
-        
+
         for i, string_info in enumerate(valid_strings):
             string_info.ml_score = probabilities[i][1]  # Probability of class 1 (meaningful)
             predictions_made += 1
-            
+
             # Count high confidence predictions
             if abs(string_info.ml_score - 0.5) > 0.3:  # >80% or <20% confidence
                 high_confidence_predictions += 1
@@ -564,10 +640,10 @@ class MLModelManager:
         self.feature_names = model_data['feature_names']
         self.is_trained = model_data['is_trained']
         self.training_history = model_data.get('training_history', [])
-        
+
         model_type = model_data.get('model_type', 'sklearn')
         print(f"[MLModelManager] Loaded {model_type} model")
-        
+
         # Update GPU usage based on loaded model and current capabilities
         if model_type == 'xgboost' and not XGB_AVAILABLE:
             print(f"[MLModelManager] Warning: Model was trained with XGBoost but XGBoost not available")
@@ -1442,7 +1518,7 @@ Features:
     def _show_multi_selection_details(self, count: int):
         """Display information about multiple selected strings"""
         self.details_text.delete(1.0, tk.END)
-        
+
         details = f"""Multiple Selection
 
 Selected Items: {count}
